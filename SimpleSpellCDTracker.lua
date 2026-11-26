@@ -17,6 +17,7 @@ local WIDGET_BG = { 0.13, 0.13, 0.15, 1 }
 local WIDGET_BORDER = { 0.30, 0.30, 0.32, 1 }
 local TEXT_MAIN = { 0.92, 0.92, 0.92 }
 local TEXT_DIM = { 0.58, 0.58, 0.62 }
+local UNAVAILABLE = { 0.32, 0.32, 0.35 }
 
 local LIST_ROWS = 8
 local ROW_HEIGHT = 24
@@ -74,6 +75,75 @@ local function CopyDefaults(src, dst)
     return dst
 end
 
+local LIMITS = {
+    barAlpha = { 0.05, 1 },
+    bgAlpha = { 0, 1 },
+    barWidth = { 120, 320 },
+    barHeight = { 14, 40 },
+    spacing = { 0, 10 },
+}
+
+local function IsNumber(v)
+    return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
+end
+
+local function Clamp(v, lo, hi)
+    return math.min(hi, math.max(lo, v))
+end
+
+local function SanitizeColor(c, default)
+    local out = {}
+    for i = 1, 3 do
+        local v = type(c) == "table" and c[i]
+        out[i] = IsNumber(v) and Clamp(v, 0, 1) or default[i]
+    end
+    return out
+end
+
+local function SanitizePosition(p)
+    if type(p) ~= "table" or type(p[1]) ~= "string" or not IsNumber(p[3]) or not IsNumber(p[4]) then
+        return nil
+    end
+    if p[2] ~= nil and type(p[2]) ~= "string" then return nil end
+    return p
+end
+
+-- Fix anything in saved settings that has the wrong type or is out of range,
+-- so a damaged or hand-edited settings file can't break the addon.
+local function SanitizeDB(db)
+    for key, range in pairs(LIMITS) do
+        db[key] = IsNumber(db[key]) and Clamp(db[key], range[1], range[2]) or DEFAULTS[key]
+    end
+    for _, key in ipairs({ "showIcons", "locked" }) do
+        if type(db[key]) ~= "boolean" then db[key] = DEFAULTS[key] end
+    end
+    for key, default in pairs(DEFAULTS.colors) do
+        db.colors[key] = SanitizeColor(db.colors[key], default)
+    end
+
+    local spells, seen = {}, {}
+    for _, entry in ipairs(db.spells) do
+        if type(entry) == "table" and type(entry.name) == "string" and entry.name ~= "" and not seen[entry.name] then
+            seen[entry.name] = true
+            table.insert(spells, { name = entry.name, id = IsNumber(entry.id) and entry.id or nil })
+        end
+    end
+    db.spells = spells
+
+    local durations = {}
+    for name, d in pairs(db.knownDurations) do
+        if seen[name] and IsNumber(d) and d > 0 then durations[name] = d end
+    end
+    db.knownDurations = durations
+
+    db.position = SanitizePosition(db.position)
+    db.optionsPosition = SanitizePosition(db.optionsPosition)
+end
+
+local function Print(msg)
+    print("|cffff7d0aSimple Spell CD Tracker|r: " .. msg)
+end
+
 -------------------------------------------------------------------------------
 -- Spell helpers
 -------------------------------------------------------------------------------
@@ -123,6 +193,25 @@ local function RepairSpellIDs(spells)
     end
 end
 
+-- False only when the player clearly doesn't have the spell (other spec, not
+-- learned yet). Anything we can't check counts as available.
+local function IsSpellAvailable(entry)
+    local ok, result = pcall(function()
+        if entry.id and IsPlayerSpell and IsPlayerSpell(entry.id) then return true end
+        if entry.id and IsSpellKnown and IsSpellKnown(entry.id) then return true end
+        -- Older clients use a different ID per rank, so also look it up by name.
+        if C_Spell and C_Spell.GetSpellInfo then
+            if C_Spell.GetSpellInfo(entry.name) then return true end
+        elseif GetSpellInfo then
+            if GetSpellInfo(entry.name) then return true end
+        end
+        if not (IsPlayerSpell or IsSpellKnown) then return true end
+        return false
+    end)
+    if not ok or IsSecret(result) then return true end
+    return result and true or false
+end
+
 local function GetCooldownInfo(spellEntry)
     if GetSpellCooldown then
         local startTime, duration, enabled = GetSpellCooldown(spellEntry.name)
@@ -136,7 +225,12 @@ local function GetCooldownInfo(spellEntry)
     end
 
     if C_Spell and C_Spell.GetSpellCooldown then
-        local info = (spellEntry.id and C_Spell.GetSpellCooldown(spellEntry.id)) or C_Spell.GetSpellCooldown(spellEntry.name)
+        -- Try the saved ID first, then the name (which follows the player's
+        -- current rank/version of the spell).
+        local info = spellEntry.id and C_Spell.GetSpellCooldown(spellEntry.id)
+        if not info or not info.duration or info.duration == 0 then
+            info = C_Spell.GetSpellCooldown(spellEntry.name) or info
+        end
         if info then
             return info.startTime or 0, info.duration or 0, info.isEnabled
         end
@@ -278,10 +372,16 @@ end
 local function ShowBarTooltip(owner, item)
     if not item.spell then return end
     GameTooltip:SetOwner(owner, "ANCHOR_RIGHT")
+    local shown = false
     if item.spell.id and GameTooltip.SetSpellByID then
-        GameTooltip:SetSpellByID(item.spell.id)
-    else
+        shown = pcall(GameTooltip.SetSpellByID, GameTooltip, item.spell.id)
+    end
+    if not shown then
+        GameTooltip:ClearLines()
         GameTooltip:AddLine(item.spell.name, 1, 1, 1)
+    end
+    if item.available == false then
+        GameTooltip:AddLine("You don't currently have this spell.", DANGER[1], DANGER[2], DANGER[3])
     end
     GameTooltip:AddLine(" ")
     GameTooltip:AddLine("Right-click for options", TEXT_DIM[1], TEXT_DIM[2], TEXT_DIM[3])
@@ -377,6 +477,7 @@ local function RebuildBars()
         end
         item.spell = entry
         item.cdStart = nil -- force the icon swipe to refresh
+        item.available = IsSpellAvailable(entry)
 
         local holder = item.holder
         holder:SetSize(w, h)
@@ -415,6 +516,20 @@ local function RebuildBars()
     end
 
     UpdateLockState()
+end
+
+-- Called when the spellbook changes (login, spec swap, new spell learned):
+-- icons may have loaded and spells may have become available or unavailable.
+local function RefreshSpellInfo()
+    for i = 1, #SimpleSpellCDTrackerDB.spells do
+        local item = barPool[i]
+        if item and item.spell then
+            item.available = IsSpellAvailable(item.spell)
+            if SimpleSpellCDTrackerDB.showIcons then
+                item.icon:SetTexture(GetSpellIcon(item.spell))
+            end
+        end
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -470,7 +585,23 @@ local function UpdateBars()
             end
 
             local c
-            if state then
+            if item.available == false then
+                c = UNAVAILABLE
+                item.bar:SetValue(1)
+                item.time:SetText("")
+                item.spark:Hide()
+                item.icon:SetDesaturated(true)
+                item.name:SetTextColor(TEXT_DIM[1], TEXT_DIM[2], TEXT_DIM[3])
+                if item.cdStart ~= 0 then
+                    item.cdStart = 0
+                    if item.cooldown.Clear then
+                        item.cooldown:Clear()
+                    else
+                        item.cooldown:SetCooldown(0, 0)
+                    end
+                end
+            elseif state then
+                item.name:SetTextColor(TEXT_MAIN[1], TEXT_MAIN[2], TEXT_MAIN[3])
                 local progress = math.min(1, math.max(0, 1 - remaining / state.duration))
                 c = remaining <= 60 and cWarn or cCool
                 item.bar:SetValue(progress)
@@ -483,6 +614,7 @@ local function UpdateBars()
                 end
             else
                 c = cReady
+                item.name:SetTextColor(TEXT_MAIN[1], TEXT_MAIN[2], TEXT_MAIN[3])
                 item.bar:SetValue(1)
                 item.time:SetText("")
                 item.spark:Hide()
@@ -543,6 +675,49 @@ local function ForEachSpellbookSpell(callback)
     end
 end
 
+-- Index of every spell ID that has a real cooldown, for searching by name.
+-- Building it touches hundreds of thousands of IDs, so it's done a slice per
+-- frame in the background (and paused in combat, where names can be hidden).
+local INDEX_MAX_ID = 500000
+local INDEX_PER_FRAME = 2500
+local indexNames, indexIDs, indexSeen = {}, {}, {}
+local indexNextID, indexDone = 1, false
+local onIndexDone -- set by the options panel
+
+local function IndexSlice()
+    local last = math.min(INDEX_MAX_ID, indexNextID + INDEX_PER_FRAME - 1)
+    for id = indexNextID, last do
+        local name = GetSpellNameByID(id)
+        if name and not IsSecret(name) and not indexSeen[name] then
+            local base = GetBaseCooldown(id)
+            if base and base > 2 then
+                indexSeen[name] = true
+                indexNames[#indexNames + 1] = name
+                indexIDs[#indexIDs + 1] = id
+            end
+        end
+    end
+    indexNextID = last + 1
+    return indexNextID > INDEX_MAX_ID
+end
+
+local indexer = CreateFrame("Frame")
+indexer:Hide()
+indexer:SetScript("OnUpdate", function(self)
+    if InCombatLockdown and InCombatLockdown() then return end
+    local ok, finished = pcall(IndexSlice)
+    if not ok or finished then
+        indexDone = true
+        indexSeen = nil
+        self:Hide()
+        if onIndexDone then pcall(onIndexDone) end
+    end
+end)
+
+local function StartSpellIndex()
+    if not indexDone then indexer:Show() end
+end
+
 local function SearchSpells(filterText)
     local results, seen = {}, {}
     local query = string.lower(filterText or "")
@@ -558,17 +733,15 @@ local function SearchSpells(filterText)
         end
     end)
 
-    -- 2. Any spell by ID once the query has 2+ characters.
-    if string.len(query) >= 2 and #results < MAX_SEARCH_RESULTS then
-        for id = 1, 60000 do
-            local name = GetSpellNameByID(id)
-            if name and not seen[name] and string.find(string.lower(name), query, 1, true) then
-                local base = GetBaseCooldown(id)
-                if base and base > 2 then
-                    seen[name] = true
-                    table.insert(results, { name = name, id = id })
-                    if #results >= MAX_SEARCH_RESULTS then break end
-                end
+    -- 2. Any spell with a cooldown, from the background index, once the query
+    --    has 2+ characters.
+    if string.len(query) >= 2 then
+        for i = 1, #indexNames do
+            if #results >= MAX_SEARCH_RESULTS then break end
+            local name = indexNames[i]
+            if not seen[name] and string.find(string.lower(name), query, 1, true) then
+                seen[name] = true
+                table.insert(results, { name = name, id = indexIDs[i] })
             end
         end
     end
@@ -577,9 +750,12 @@ local function SearchSpells(filterText)
     return results
 end
 
+-- Returns the results, or nil if the search couldn't run (e.g. the game is
+-- hiding spell data in combat).
 local function GetSearchableSpells(filterText)
     local ok, results = pcall(SearchSpells, filterText)
-    return ok and results or {}
+    if ok then return results end
+    return nil
 end
 
 -------------------------------------------------------------------------------
@@ -631,6 +807,8 @@ local function CreateCheckbox(parent, label, getter, setter)
     local text = CreateText(b, 11, TEXT_MAIN)
     text:SetPoint("LEFT", box, "RIGHT", 8, 0)
     text:SetText(label)
+    -- Clickable area ends at the label, so neighbouring checkboxes don't overlap.
+    b:SetWidth(14 + 8 + math.ceil(text:GetStringWidth()) + 4)
 
     function b:Refresh()
         mark:SetShown(getter() and true or false)
@@ -975,6 +1153,7 @@ local function CreateOptionsPanel()
     end
 
     local searchMode, offset, entries = false, 0, db.spells
+    local searchFailed = false
     local RefreshList
 
     local function IsTracked(name)
@@ -1024,7 +1203,10 @@ local function CreateOptionsPanel()
                     SetButtonEnabled(row.btn, true)
                     row.btn:SetScript("OnClick", function()
                         local removed = table.remove(db.spells, idx)
-                        if removed then cdState[removed.name] = nil end
+                        if removed then
+                            cdState[removed.name] = nil
+                            db.knownDurations[removed.name] = nil
+                        end
                         RebuildBars()
                         RefreshList()
                     end)
@@ -1036,8 +1218,19 @@ local function CreateOptionsPanel()
         end
 
         if #entries == 0 then
-            emptyText:SetText(searchMode and "No matching spells."
-                or "No cooldowns tracked yet.\nClick + Add to choose spells.")
+            local msg
+            if not searchMode then
+                msg = "No cooldowns tracked yet.\nClick + Add to choose spells."
+            elseif searchFailed then
+                msg = "Spell search isn't available right now.\nTry again out of combat."
+            elseif not indexDone and string.len(searchBox:GetText()) >= 2 then
+                msg = "Loading the full spell list...\nResults will appear in a few seconds."
+            elseif searchBox:GetText() == "" then
+                msg = "Type a spell name to search."
+            else
+                msg = "No matching spells."
+            end
+            emptyText:SetText(msg)
             emptyText:Show()
         else
             emptyText:Hide()
@@ -1057,17 +1250,32 @@ local function CreateOptionsPanel()
         end
     end
 
+    local function RunSearch()
+        local results = GetSearchableSpells(searchBox:GetText())
+        searchFailed = results == nil
+        entries = results or {}
+        offset = 0
+        RefreshList()
+    end
+
+    -- When the background index finishes, refresh an open search.
+    onIndexDone = function()
+        if searchMode and f:IsShown() then RunSearch() end
+    end
+
     local function SetSearchMode(on)
         searchMode = on
         offset = 0
         list:ClearAllPoints()
         if on then
+            StartSpellIndex()
             addBtn.label:SetText("Done")
             searchBox:Show()
             searchBox:SetText("")
             searchBox:SetFocus()
             list:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -310)
-            entries = GetSearchableSpells("")
+            RunSearch()
+            return
         else
             addBtn.label:SetText("+ Add")
             searchBox:ClearFocus()
@@ -1094,9 +1302,7 @@ local function CreateOptionsPanel()
         local token = searchToken
         local function Run()
             if token ~= searchToken or not searchMode then return end
-            entries = GetSearchableSpells(self:GetText())
-            offset = 0
-            RefreshList()
+            RunSearch()
         end
         if C_Timer and C_Timer.After then
             C_Timer.After(0.25, Run)
@@ -1118,8 +1324,12 @@ local function CreateOptionsPanel()
     footer:SetJustifyH("CENTER")
     footer:SetText("Right-click a bar or type /sscd to open this window")
 
-    f:SetScript("OnShow", function()
+    function f:RefreshControls()
         for _, c in ipairs(controls) do c:Refresh() end
+    end
+
+    f:SetScript("OnShow", function(self)
+        self:RefreshControls()
         SetSearchMode(false)
     end)
 
@@ -1131,29 +1341,75 @@ ToggleOptions = function()
     optionsFrame:SetShown(not optionsFrame:IsShown())
 end
 
+local initialized = false
+
+local function SetLocked(locked)
+    SimpleSpellCDTrackerDB.locked = locked
+    UpdateLockState()
+    if optionsFrame and optionsFrame:IsShown() then optionsFrame:RefreshControls() end
+end
+
 SLASH_SIMPLESPELLCD1 = "/sscd"
 SLASH_SIMPLESPELLCD2 = "/spellcd"
-SlashCmdList.SIMPLESPELLCD = function() ToggleOptions() end
+SlashCmdList.SIMPLESPELLCD = function(msg)
+    if not initialized then
+        Print("still loading, try again in a moment.")
+        return
+    end
+    local cmd = string.lower((msg or ""):match("^%s*(.-)%s*$"))
+    if cmd == "" or cmd == "options" or cmd == "config" then
+        ToggleOptions()
+    elseif cmd == "lock" then
+        SetLocked(true)
+        Print("bars locked.")
+    elseif cmd == "unlock" then
+        SetLocked(false)
+        Print("bars unlocked. Drag them to move, then type /sscd lock.")
+    elseif cmd == "reset" then
+        SimpleSpellCDTrackerDB.position = nil
+        ApplyPosition()
+        Print("bar position reset.")
+    else
+        Print("commands:")
+        print("  /sscd - open options")
+        print("  /sscd lock | unlock - lock or unlock the bars")
+        print("  /sscd reset - move the bars back to the default position")
+    end
+end
 
 -------------------------------------------------------------------------------
 -- Events
 -------------------------------------------------------------------------------
+local function Initialize(eventFrame)
+    SimpleSpellCDTrackerDB = CopyDefaults(DEFAULTS, SimpleSpellCDTrackerDB)
+    SanitizeDB(SimpleSpellCDTrackerDB)
+    RepairSpellIDs(SimpleSpellCDTrackerDB.spells)
+    ApplyPosition()
+    optionsFrame = CreateOptionsPanel()
+    RebuildBars()
+    eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
+    eventFrame:RegisterEvent("SPELLS_CHANGED")
+    initialized = true
+    if #SimpleSpellCDTrackerDB.spells == 0 then
+        Print("no spells tracked yet. Type /sscd to add some.")
+    end
+end
+
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("PLAYER_LOGIN")
 eventFrame:SetScript("OnEvent", function(self, event, ...)
     if event == "PLAYER_LOGIN" then
-        SimpleSpellCDTrackerDB = CopyDefaults(DEFAULTS, SimpleSpellCDTrackerDB)
-        RepairSpellIDs(SimpleSpellCDTrackerDB.spells)
-        ApplyPosition()
-        optionsFrame = CreateOptionsPanel()
-        RebuildBars()
-        self:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
-        if #SimpleSpellCDTrackerDB.spells == 0 then
-            print("|cffff7d0aSimple Spell CD Tracker|r: no spells tracked yet. Type /sscd to add some.")
+        local ok, err = pcall(Initialize, self)
+        if not ok then
+            Print("failed to load: " .. tostring(err))
         end
+    elseif not initialized then
+        return
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         local _, _, spellID = ...
         pcall(OnPlayerSpellCast, spellID)
+    elseif event == "SPELLS_CHANGED" then
+        pcall(RefreshSpellInfo)
     end
 end)
 
@@ -1162,7 +1418,7 @@ end)
 local elapsedSinceUpdate = 0
 local errorReported = false
 container:SetScript("OnUpdate", function(_, elapsed)
-    if not SimpleSpellCDTrackerDB then return end
+    if not initialized then return end
     elapsedSinceUpdate = elapsedSinceUpdate + elapsed
     if elapsedSinceUpdate < 0.05 then return end
     elapsedSinceUpdate = 0
@@ -1170,6 +1426,6 @@ container:SetScript("OnUpdate", function(_, elapsed)
     local ok, err = pcall(UpdateBars)
     if not ok and not errorReported then
         errorReported = true
-        print("|cffff7d0aSimple Spell CD Tracker|r error (shown once per session): " .. tostring(err))
+        Print("error (shown once per session): " .. tostring(err))
     end
 end)
