@@ -222,19 +222,33 @@ local moverLabel = CreateText(container, 10, ACCENT, "OUTLINE")
 moverLabel:SetPoint("BOTTOM", container, "TOP", 0, 8)
 moverLabel:SetText("Simple Spell CD Tracker - drag to move")
 
-local function SavePosition()
-    local point, _, relPoint, x, y = container:GetPoint(1)
-    SimpleSpellCDTrackerDB.position = { point, relPoint, x, y }
+-- Positions are stored as { point, relativePoint, x, y } against UIParent.
+-- After a drag we always store the frame's top-left corner, so the top edge
+-- stays put when the frame changes size (adding spells, changing bar height).
+local function ApplyFramePosition(frame, key, defaultPoint, defaultX, defaultY)
+    frame:ClearAllPoints()
+    local p = SimpleSpellCDTrackerDB[key]
+    if type(p) == "table" and p[1] and p[3] and p[4] then
+        frame:SetPoint(p[1], UIParent, p[2] or p[1], p[3], p[4])
+    else
+        frame:SetPoint(defaultPoint, UIParent, defaultPoint, defaultX, defaultY)
+    end
+end
+
+local function SaveFramePosition(frame, key)
+    local left, top = frame:GetLeft(), frame:GetTop()
+    if not left or not top then return end
+    local scale = frame:GetEffectiveScale() / UIParent:GetEffectiveScale()
+    SimpleSpellCDTrackerDB[key] = { "TOPLEFT", "BOTTOMLEFT", left * scale, top * scale }
 end
 
 local function ApplyPosition()
-    container:ClearAllPoints()
-    local p = SimpleSpellCDTrackerDB.position
-    if p then
-        container:SetPoint(p[1], UIParent, p[2], p[3], p[4])
-    else
-        container:SetPoint("CENTER", UIParent, "CENTER", 0, -120)
-    end
+    ApplyFramePosition(container, "position", "CENTER", 0, -120)
+end
+
+local function SavePosition()
+    SaveFramePosition(container, "position")
+    ApplyPosition() -- re-anchor at top-left right away
 end
 
 local function StartDrag()
@@ -773,10 +787,11 @@ local function CreateOptionsPanel()
 
     local f = CreateFrame("Frame", "SimpleSpellCDTrackerOptions", UIParent)
     f:SetSize(360, 540)
-    f:SetPoint("CENTER", UIParent, "CENTER", 0, 40)
+    ApplyFramePosition(f, "optionsPosition", "CENTER", 0, 40)
     f:SetFrameStrata("DIALOG")
     f:SetClampedToScreen(true)
     f:SetMovable(true)
+    if f.SetDontSavePosition then f:SetDontSavePosition(true) end -- we save it ourselves
     f:EnableMouse(true)
     f:Hide()
     AddBackdrop(f, PANEL_BG, PANEL_BORDER)
@@ -790,7 +805,11 @@ local function CreateOptionsPanel()
     titleBar:EnableMouse(true)
     titleBar:RegisterForDrag("LeftButton")
     titleBar:SetScript("OnDragStart", function() f:StartMoving() end)
-    titleBar:SetScript("OnDragStop", function() f:StopMovingOrSizing() end)
+    titleBar:SetScript("OnDragStop", function()
+        f:StopMovingOrSizing()
+        SaveFramePosition(f, "optionsPosition")
+        ApplyFramePosition(f, "optionsPosition", "CENTER", 0, 40)
+    end)
 
     local titleBg = titleBar:CreateTexture(nil, "BACKGROUND")
     titleBg:SetAllPoints(titleBar)
