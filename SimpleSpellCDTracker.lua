@@ -43,6 +43,8 @@ local DEFAULTS = {
     onlyOnCooldown = false,
     alertSound = true,
     alertFlash = true,
+    showMinimap = true,
+    minimapAngle = 220, -- degrees around the minimap edge
     colors = {
         ready = { 0.15, 0.85, 0.20 },
         cooldown = { 0.90, 0.15, 0.15 },
@@ -98,7 +100,8 @@ local LIMITS = {
     barHeight = { 14, 40 },
     spacing = { 0, 10 },
 }
-local BOOLEANS = { "reverse", "showIcons", "locked", "hideOutOfCombat", "onlyOnCooldown", "alertSound", "alertFlash" }
+local BOOLEANS = { "reverse", "showIcons", "locked", "hideOutOfCombat", "onlyOnCooldown", "alertSound", "alertFlash",
+    "showMinimap" }
 
 local function IsNumber(v)
     return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
@@ -170,6 +173,7 @@ local function SanitizeDB(d)
         if type(d[key]) ~= "boolean" then d[key] = DEFAULTS[key] end
     end
     if d.style ~= "bars" and d.style ~= "icons" then d.style = DEFAULTS.style end
+    d.minimapAngle = IsNumber(d.minimapAngle) and (d.minimapAngle % 360) or DEFAULTS.minimapAngle
     for key, default in pairs(DEFAULTS.colors) do
         d.colors[key] = SanitizeColor(d.colors[key], default)
     end
@@ -430,6 +434,7 @@ end
 -------------------------------------------------------------------------------
 local ToggleOptions -- defined after the options panel
 local UpdateVisibility -- defined after the options panel
+local UpdateMinimapButton -- defined with the minimap button
 local optionsFrame
 
 local container = CreateFrame("Frame", "SimpleSpellCDTrackerContainer", UIParent)
@@ -1448,6 +1453,8 @@ local function CreateOptionsPanel()
         "Play a sound when a cooldown with alerts on becomes ready.\nTurn alerts on per spell in the list below.")
     AddCheckbox("Alert flash", "alertFlash", 112, -110, nil,
         "Flash the bar when a cooldown with alerts on becomes ready.\nTurn alerts on per spell in the list below.")
+    AddCheckbox("Minimap button", "showMinimap", 208, -110, function() UpdateMinimapButton() end,
+        "Show the " .. ADDON_TITLE .. " button on the minimap.\nYou can also use /sscd minimap.")
 
     -- Appearance
     CreateSectionHeader(f, "Appearance", -140)
@@ -1905,6 +1912,90 @@ local function SetLocked(locked)
     if optionsFrame and optionsFrame:IsShown() then optionsFrame:RefreshControls() end
 end
 
+-------------------------------------------------------------------------------
+-- Minimap button
+-------------------------------------------------------------------------------
+local minimapButton
+
+local function PositionMinimapButton()
+    local angle = math.rad(db.minimapAngle)
+    local radius = (Minimap:GetWidth() or 140) / 2 + 10
+    minimapButton:ClearAllPoints()
+    minimapButton:SetPoint("CENTER", Minimap, "CENTER", math.cos(angle) * radius, math.sin(angle) * radius)
+end
+
+local function CreateMinimapButton()
+    if not Minimap or minimapButton then return end
+    local b = CreateFrame("Button", "SimpleSpellCDTrackerMinimapButton", Minimap)
+    b:SetSize(31, 31)
+    b:SetFrameStrata("MEDIUM")
+    b:SetFrameLevel(8)
+    b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    b:RegisterForDrag("LeftButton")
+    b:SetHighlightTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
+
+    local bg = b:CreateTexture(nil, "BACKGROUND")
+    bg:SetTexture("Interface\\Minimap\\UI-Minimap-Background")
+    bg:SetSize(20, 20)
+    bg:SetPoint("TOPLEFT", b, "TOPLEFT", 7, -5)
+    local icon = b:CreateTexture(nil, "ARTWORK")
+    icon:SetTexture("Interface\\AddOns\\" .. ADDON_NAME .. "\\media\\icon")
+    icon:SetTexCoord(0.06, 0.94, 0.06, 0.94)
+    icon:SetSize(18, 18)
+    icon:SetPoint("TOPLEFT", b, "TOPLEFT", 7, -6)
+    local border = b:CreateTexture(nil, "OVERLAY")
+    border:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
+    border:SetSize(53, 53)
+    border:SetPoint("TOPLEFT", b, "TOPLEFT", 0, 0)
+
+    b:SetScript("OnClick", function(_, button)
+        if button == "RightButton" then
+            SetLocked(not db.locked)
+            Print(db.locked and "bars locked." or "bars unlocked. Drag them to move.")
+        else
+            ToggleOptions()
+        end
+    end)
+
+    -- Drag around the minimap edge.
+    b:SetScript("OnDragStart", function(self)
+        self:SetScript("OnUpdate", function()
+            local mx, my = Minimap:GetCenter()
+            local cx, cy = GetCursorPosition()
+            local scale = Minimap:GetEffectiveScale()
+            if mx and cx then
+                db.minimapAngle = math.deg(math.atan2(cy / scale - my, cx / scale - mx)) % 360
+                PositionMinimapButton()
+            end
+        end)
+    end)
+    b:SetScript("OnDragStop", function(self)
+        self:SetScript("OnUpdate", nil)
+    end)
+
+    b:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+        GameTooltip:AddLine(ADDON_TITLE, ACCENT[1], ACCENT[2], ACCENT[3])
+        GameTooltip:AddLine("Left-click: open options", 1, 1, 1)
+        GameTooltip:AddLine("Right-click: " .. (db.locked and "unlock" or "lock") .. " bars", 1, 1, 1)
+        GameTooltip:AddLine("Drag: move this button", TEXT_DIM[1], TEXT_DIM[2], TEXT_DIM[3])
+        GameTooltip:Show()
+    end)
+    b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    minimapButton = b
+end
+
+UpdateMinimapButton = function()
+    if not minimapButton then return end
+    if db.showMinimap then
+        PositionMinimapButton()
+        minimapButton:Show()
+    else
+        minimapButton:Hide()
+    end
+end
+
 SLASH_SIMPLESPELLCD1 = "/sscd"
 SLASH_SIMPLESPELLCD2 = "/spellcd"
 SlashCmdList.SIMPLESPELLCD = function(msg)
@@ -1925,11 +2016,17 @@ SlashCmdList.SIMPLESPELLCD = function(msg)
         db.position = nil
         ApplyPosition()
         Print("bar position reset.")
+    elseif cmd == "minimap" then
+        db.showMinimap = not db.showMinimap
+        UpdateMinimapButton()
+        if optionsFrame and optionsFrame:IsShown() then optionsFrame:RefreshControls() end
+        Print(db.showMinimap and "minimap button shown." or "minimap button hidden. Type /sscd minimap to bring it back.")
     else
         Print("commands:")
         print("  /sscd - open options")
         print("  /sscd lock | unlock - lock or unlock the bars")
         print("  /sscd reset - move the bars back to the default position")
+        print("  /sscd minimap - show or hide the minimap button")
     end
 end
 
@@ -1954,6 +2051,8 @@ local function Initialize(eventFrame)
     inCombat = (UnitAffectingCombat and UnitAffectingCombat("player")) and true or false
     optionsFrame = CreateOptionsPanel()
     pcall(RegisterSettingsPage)
+    pcall(CreateMinimapButton)
+    pcall(UpdateMinimapButton)
     ConfigureBars()
 
     eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")

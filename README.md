@@ -23,6 +23,8 @@ Clean, configurable cooldown bars for spells and items.
 - `/sscd` or `/spellcd` opens the options window
 - `/sscd lock` / `/sscd unlock` locks or unlocks the bars
 - `/sscd reset` moves the bars back to the default position
+- `/sscd minimap` shows or hides the minimap button
+- Minimap button: left-click for options, right-click to lock/unlock, drag to move
 - Right-click any bar to open options
 - Untick **Lock bars** to drag the bars around
 
