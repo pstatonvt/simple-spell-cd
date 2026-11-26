@@ -2,18 +2,21 @@
 
 # Simple Spell CD Tracker
 
-Clean, configurable cooldown bars for any spell.
+Clean, configurable cooldown bars for spells and items.
 
 ## Features
 
-- One bar per tracked spell, with icon, name and time remaining
+- Track spells and usable items (trinkets, potions, healthstones)
+- Separate tracked list for each character; look and settings shared
+- Bars or compact icons, growing either direction
 - Colors for ready, on cooldown, and under 60 seconds (all customizable)
-- Search your spellbook (or any spell by name) to add cooldowns
-- Adjustable bar width, height, bar opacity and background opacity
-- Lock/unlock and drag to position; position is saved
-- Optionally hide the bars outside of combat
-- Spells you don't currently have (other spec, not learned yet) are greyed out
+- Optional ready alert per cooldown: sound and/or a flash
+- Show charges for spells with more than one charge
+- Reorder tracked cooldowns
+- Optionally hide outside of combat, or show only what's on cooldown
+- Spells and items you don't currently have are greyed out
 - Keeps timing in combat, where the game hides cooldown values from addons
+- Settings page under Esc > Options > AddOns
 
 ## Usage
 

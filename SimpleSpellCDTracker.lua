@@ -1,4 +1,5 @@
 local ADDON_NAME = ...
+local ADDON_TITLE = "Simple Spell CD Tracker"
 
 -------------------------------------------------------------------------------
 -- Style
@@ -19,32 +20,47 @@ local TEXT_MAIN = { 0.92, 0.92, 0.92 }
 local TEXT_DIM = { 0.58, 0.58, 0.62 }
 local UNAVAILABLE = { 0.32, 0.32, 0.35 }
 
-local LIST_ROWS = 8
+local LIST_ROWS = 7
 local ROW_HEIGHT = 24
 local MAX_SEARCH_RESULTS = 40
+local ALERT_SOUND = (SOUNDKIT and SOUNDKIT.ALARM_CLOCK_WARNING_3) or 12889
 
 -------------------------------------------------------------------------------
 -- Saved variables
 -------------------------------------------------------------------------------
+-- Account-wide: look and behaviour. SimpleSpellCDTrackerDB
 local DEFAULTS = {
     barAlpha = 1.0,
     bgAlpha = 0.6,
     barWidth = 200,
     barHeight = 22,
     spacing = 3,
+    style = "bars", -- "bars" or "icons"
+    reverse = false, -- bars grow upward / icons grow to the left
     showIcons = true,
     locked = true,
     hideOutOfCombat = false,
+    onlyOnCooldown = false,
+    alertSound = true,
+    alertFlash = true,
     colors = {
         ready = { 0.15, 0.85, 0.20 },
         cooldown = { 0.90, 0.15, 0.15 },
         warning = { 0.95, 0.85, 0.10 },
     },
+}
+
+-- Per character: what to track. SimpleSpellCDTrackerCharDB
+-- Each entry is a spell { name, id, alert } or an item
+-- { type = "item", id = itemID, name, spellID = use-effect spell, alert }.
+local CHAR_DEFAULTS = {
     spells = {},
-    -- Last full cooldown length seen out of combat, by spell name. Used to run
+    -- Last full cooldown length seen out of combat, by entry key. Used to run
     -- our own timer in combat, where the game hides real cooldown values.
     knownDurations = {},
 }
+
+local db, charDB -- set at login
 
 local function DeepCopy(src)
     if type(src) ~= "table" then return src end
@@ -56,8 +72,7 @@ local function DeepCopy(src)
 end
 
 -- Keys whose saved value replaces the default as a whole instead of being
--- merged slot by slot. Merging a list would bring removed defaults back and
--- copy default fields (like a spell id) onto whatever spell sits in that slot.
+-- merged slot by slot (merging a list would mix default entries into it).
 local REPLACE_WHOLE = { spells = true }
 
 local function CopyDefaults(src, dst)
@@ -83,6 +98,7 @@ local LIMITS = {
     barHeight = { 14, 40 },
     spacing = { 0, 10 },
 }
+local BOOLEANS = { "reverse", "showIcons", "locked", "hideOutOfCombat", "onlyOnCooldown", "alertSound", "alertFlash" }
 
 local function IsNumber(v)
     return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
@@ -90,6 +106,13 @@ end
 
 local function Clamp(v, lo, hi)
     return math.min(hi, math.max(lo, v))
+end
+
+local function EntryKey(entry)
+    if entry.type == "item" then
+        return "item:" .. tostring(entry.id)
+    end
+    return entry.name
 end
 
 local function SanitizeColor(c, default)
@@ -109,44 +132,79 @@ local function SanitizePosition(p)
     return p
 end
 
--- Fix anything in saved settings that has the wrong type or is out of range,
--- so a damaged or hand-edited settings file can't break the addon.
-local function SanitizeDB(db)
-    for key, range in pairs(LIMITS) do
-        db[key] = IsNumber(db[key]) and Clamp(db[key], range[1], range[2]) or DEFAULTS[key]
-    end
-    for _, key in ipairs({ "showIcons", "locked", "hideOutOfCombat" }) do
-        if type(db[key]) ~= "boolean" then db[key] = DEFAULTS[key] end
-    end
-    for key, default in pairs(DEFAULTS.colors) do
-        db.colors[key] = SanitizeColor(db.colors[key], default)
-    end
-
-    local spells, seen = {}, {}
-    for _, entry in ipairs(db.spells) do
-        if type(entry) == "table" and type(entry.name) == "string" and entry.name ~= "" and not seen[entry.name] then
-            seen[entry.name] = true
-            table.insert(spells, { name = entry.name, id = IsNumber(entry.id) and entry.id or nil })
+-- Returns a clean copy of a tracked list plus the set of keys in it.
+local function SanitizeEntries(list)
+    local out, seen = {}, {}
+    if type(list) ~= "table" then return out, seen end
+    for _, e in ipairs(list) do
+        if type(e) == "table" and type(e.name) == "string" and e.name ~= "" then
+            local clean
+            if e.type == "item" then
+                if IsNumber(e.id) then
+                    clean = { type = "item", id = e.id, name = e.name,
+                        spellID = IsNumber(e.spellID) and e.spellID or nil }
+                end
+            else
+                clean = { name = e.name, id = IsNumber(e.id) and e.id or nil }
+            end
+            if clean then
+                clean.alert = e.alert == true or nil
+                local key = EntryKey(clean)
+                if not seen[key] then
+                    seen[key] = true
+                    table.insert(out, clean)
+                end
+            end
         end
     end
-    db.spells = spells
+    return out, seen
+end
 
-    local durations = {}
-    for name, d in pairs(db.knownDurations) do
-        if seen[name] and IsNumber(d) and d > 0 then durations[name] = d end
+-- Fix anything in saved settings that has the wrong type or is out of range,
+-- so a damaged or hand-edited settings file can't break the addon.
+local function SanitizeDB(d)
+    for key, range in pairs(LIMITS) do
+        d[key] = IsNumber(d[key]) and Clamp(d[key], range[1], range[2]) or DEFAULTS[key]
     end
-    db.knownDurations = durations
+    for _, key in ipairs(BOOLEANS) do
+        if type(d[key]) ~= "boolean" then d[key] = DEFAULTS[key] end
+    end
+    if d.style ~= "bars" and d.style ~= "icons" then d.style = DEFAULTS.style end
+    for key, default in pairs(DEFAULTS.colors) do
+        d.colors[key] = SanitizeColor(d.colors[key], default)
+    end
+    d.position = SanitizePosition(d.position)
+    d.optionsPosition = SanitizePosition(d.optionsPosition)
 
-    db.position = SanitizePosition(db.position)
-    db.optionsPosition = SanitizePosition(db.optionsPosition)
+    -- Before 1.3.0 the tracked list was account-wide. Keep it aside so it can
+    -- be handed to the character it belongs to.
+    if type(d.spells) == "table" then
+        if #d.spells > 0 and type(d.legacy) ~= "table" then
+            d.legacy = { spells = d.spells, durations = type(d.knownDurations) == "table" and d.knownDurations or {} }
+        end
+        d.spells = nil
+    end
+    d.knownDurations = nil
+    if type(d.legacy) ~= "table" or type(d.legacy.spells) ~= "table" then d.legacy = nil end
+end
+
+local function SanitizeCharDB(c)
+    local spells, seen = SanitizeEntries(c.spells)
+    c.spells = spells
+    local durations = {}
+    for key, d in pairs(c.knownDurations) do
+        if seen[key] and IsNumber(d) and d > 0 then durations[key] = d end
+    end
+    c.knownDurations = durations
+    if type(c.migrated) ~= "boolean" then c.migrated = nil end
 end
 
 local function Print(msg)
-    print("|cffff7d0aSimple Spell CD Tracker|r: " .. msg)
+    print("|cffff7d0a" .. ADDON_TITLE .. "|r: " .. msg)
 end
 
 -------------------------------------------------------------------------------
--- Spell helpers
+-- Game data helpers
 -------------------------------------------------------------------------------
 local function IsSecret(value)
     return issecretvalue ~= nil and issecretvalue(value) and true or false
@@ -161,18 +219,6 @@ local function GetSpellNameByID(id)
     end
 end
 
-local function GetSpellIcon(entry)
-    local key = entry.id or entry.name
-    local tex
-    if C_Spell and C_Spell.GetSpellTexture then
-        tex = C_Spell.GetSpellTexture(key)
-    end
-    if not tex and GetSpellTexture then
-        tex = GetSpellTexture(key)
-    end
-    return tex or QUESTION_ICON
-end
-
 -- Base cooldown in seconds, or nil if unknown.
 local function GetBaseCooldown(spellID)
     if not spellID or not GetSpellBaseCooldown then return nil end
@@ -181,22 +227,38 @@ local function GetBaseCooldown(spellID)
     return ms / 1000
 end
 
--- Earlier versions merged the default list into saved spells, which could give
--- a spell another spell's id. Drop any id that doesn't match the spell's name.
-local function RepairSpellIDs(spells)
-    for _, entry in ipairs(spells) do
-        if entry.id then
-            local idName = GetSpellNameByID(entry.id)
-            if idName and idName ~= entry.name then
-                entry.id = nil
-            end
-        end
+local function GetItemName(itemID)
+    if C_Item and C_Item.GetItemNameByID then
+        local name = C_Item.GetItemNameByID(itemID)
+        if name then return name end
+    end
+    if GetItemInfo then
+        return (GetItemInfo(itemID))
     end
 end
 
--- False only when the player clearly doesn't have the spell (other spec, not
--- learned yet). Anything we can't check counts as available.
-local function IsSpellAvailable(entry)
+-- The spell an item casts when used, or nil if it has no use effect.
+local function GetItemUseSpell(itemID)
+    local fn = (C_Item and C_Item.GetItemSpell) or GetItemSpell
+    if not fn then return nil end
+    local _, spellID = fn(itemID)
+    return spellID
+end
+
+local function PlayerHasItem(itemID)
+    local count = (C_Item and C_Item.GetItemCount) or GetItemCount
+    local equipped = (C_Item and C_Item.IsEquippedItem) or IsEquippedItem
+    if equipped and equipped(itemID) then return true end
+    if count then
+        local n = count(itemID)
+        return n ~= nil and n > 0
+    end
+    return true
+end
+
+-- True when the player has the spell. With strict = false, anything we can't
+-- check counts as available; with strict = true it counts as not available.
+local function IsSpellAvailable(entry, strict)
     local ok, result = pcall(function()
         if entry.id and IsPlayerSpell and IsPlayerSpell(entry.id) then return true end
         if entry.id and IsSpellKnown and IsSpellKnown(entry.id) then return true end
@@ -206,18 +268,51 @@ local function IsSpellAvailable(entry)
         elseif GetSpellInfo then
             if GetSpellInfo(entry.name) then return true end
         end
-        if not (IsPlayerSpell or IsSpellKnown) then return true end
+        if not (IsPlayerSpell or IsSpellKnown) then return not strict end
         return false
     end)
-    if not ok or IsSecret(result) then return true end
+    if not ok or IsSecret(result) then return not strict end
     return result and true or false
 end
 
-local function GetCooldownInfo(spellEntry)
+local function IsEntryAvailable(entry)
+    if entry.type == "item" then
+        local ok, has = pcall(PlayerHasItem, entry.id)
+        if not ok or IsSecret(has) then return true end
+        return has
+    end
+    return IsSpellAvailable(entry, false)
+end
+
+local function GetEntryIcon(entry)
+    local ok, tex = pcall(function()
+        if entry.type == "item" then
+            local fn = (C_Item and C_Item.GetItemIconByID) or GetItemIcon
+            return fn and fn(entry.id)
+        end
+        local key = entry.id or entry.name
+        local t
+        if C_Spell and C_Spell.GetSpellTexture then t = C_Spell.GetSpellTexture(key) end
+        if not t and GetSpellTexture then t = GetSpellTexture(key) end
+        return t
+    end)
+    return (ok and tex) or QUESTION_ICON
+end
+
+local function GetCooldownInfo(entry)
+    if entry.type == "item" then
+        local fn = (C_Container and C_Container.GetItemCooldown) or GetItemCooldown
+        if fn then
+            local startTime, duration, enabled = fn(entry.id)
+            return startTime or 0, duration or 0, enabled
+        end
+        return 0, 0, 1
+    end
+
     if GetSpellCooldown then
-        local startTime, duration, enabled = GetSpellCooldown(spellEntry.name)
-        if (not duration or duration == 0) and spellEntry.id then
-            local s2, d2, e2 = GetSpellCooldown(spellEntry.id)
+        local startTime, duration, enabled = GetSpellCooldown(entry.name)
+        if (not duration or duration == 0) and entry.id then
+            local s2, d2, e2 = GetSpellCooldown(entry.id)
             if d2 and d2 > 0 then
                 startTime, duration, enabled = s2, d2, e2
             end
@@ -228,9 +323,9 @@ local function GetCooldownInfo(spellEntry)
     if C_Spell and C_Spell.GetSpellCooldown then
         -- Try the saved ID first, then the name (which follows the player's
         -- current rank/version of the spell).
-        local info = spellEntry.id and C_Spell.GetSpellCooldown(spellEntry.id)
+        local info = entry.id and C_Spell.GetSpellCooldown(entry.id)
         if not info or not info.duration or info.duration == 0 then
-            info = C_Spell.GetSpellCooldown(spellEntry.name) or info
+            info = C_Spell.GetSpellCooldown(entry.name) or info
         end
         if info then
             return info.startTime or 0, info.duration or 0, info.isEnabled
@@ -242,12 +337,43 @@ end
 
 -- Returns start, duration, enabled when the game lets us read them, or nil when
 -- the values are secret (in combat) or the call fails.
-local function ReadCooldown(spellEntry)
-    local ok, startTime, duration, enabled = pcall(GetCooldownInfo, spellEntry)
+local function ReadCooldown(entry)
+    local ok, startTime, duration, enabled = pcall(GetCooldownInfo, entry)
     if not ok or IsSecret(startTime) or IsSecret(duration) or IsSecret(enabled) then
         return nil
     end
     return startTime, duration, enabled
+end
+
+-- Current and max charges for spells with more than one charge, else nil.
+local function GetCharges(entry)
+    if entry.type == "item" or not entry.id then return nil end
+    local ok, cur, max = pcall(function()
+        if C_Spell and C_Spell.GetSpellCharges then
+            local c = C_Spell.GetSpellCharges(entry.id)
+            if c then return c.currentCharges, c.maxCharges end
+            return nil
+        elseif GetSpellCharges then
+            return GetSpellCharges(entry.id)
+        end
+    end)
+    if not ok or IsSecret(cur) or IsSecret(max) or not IsNumber(cur) or not IsNumber(max) or max <= 1 then
+        return nil
+    end
+    return cur, max
+end
+
+-- Earlier versions could give a spell another spell's id. Drop any id that
+-- doesn't match the spell's name.
+local function RepairSpellIDs(list)
+    for _, entry in ipairs(list) do
+        if entry.type ~= "item" and entry.id then
+            local ok, idName = pcall(GetSpellNameByID, entry.id)
+            if ok and idName and not IsSecret(idName) and idName ~= entry.name then
+                entry.id = nil
+            end
+        end
+    end
 end
 
 local function FormatTime(seconds)
@@ -291,11 +417,20 @@ local function SetTexColor(tex, c, a)
     tex:SetColorTexture(c[1], c[2], c[3], a or c[4] or 1)
 end
 
+local function ClearCooldown(cd)
+    if cd.Clear then
+        cd:Clear()
+    else
+        cd:SetCooldown(0, 0)
+    end
+end
+
 -------------------------------------------------------------------------------
--- Cooldown bars
+-- Frame, position and visibility
 -------------------------------------------------------------------------------
 local ToggleOptions -- defined after the options panel
 local UpdateVisibility -- defined after the options panel
+local optionsFrame
 
 local container = CreateFrame("Frame", "SimpleSpellCDTrackerContainer", UIParent)
 container:SetSize(200, 22)
@@ -316,14 +451,22 @@ moverFill:SetPoint("BOTTOMRIGHT", container, "BOTTOMRIGHT", 4, -4)
 moverFill:SetColorTexture(0, 0, 0, 0.6)
 local moverLabel = CreateText(container, 10, ACCENT, "OUTLINE")
 moverLabel:SetPoint("BOTTOM", container, "TOP", 0, 8)
-moverLabel:SetText("Simple Spell CD Tracker - drag to move")
+moverLabel:SetText(ADDON_TITLE .. " - drag to move")
+
+-- The corner that stays fixed as bars are added or hidden: the top-left
+-- normally, the bottom-left when bars grow upward, the top-right when icons
+-- grow to the left.
+local function GetAnchorCorner()
+    if db.reverse then
+        return db.style == "icons" and "TOPRIGHT" or "BOTTOMLEFT"
+    end
+    return "TOPLEFT"
+end
 
 -- Positions are stored as { point, relativePoint, x, y } against UIParent.
--- After a drag we always store the frame's top-left corner, so the top edge
--- stays put when the frame changes size (adding spells, changing bar height).
 local function ApplyFramePosition(frame, key, defaultPoint, defaultX, defaultY)
     frame:ClearAllPoints()
-    local p = SimpleSpellCDTrackerDB[key]
+    local p = db[key]
     if type(p) == "table" and p[1] and p[3] and p[4] then
         frame:SetPoint(p[1], UIParent, p[2] or p[1], p[3], p[4])
     else
@@ -331,31 +474,34 @@ local function ApplyFramePosition(frame, key, defaultPoint, defaultX, defaultY)
     end
 end
 
-local function SaveFramePosition(frame, key)
-    local left, top = frame:GetLeft(), frame:GetTop()
-    if not left or not top then return end
+local function SaveFramePosition(frame, key, corner)
+    corner = corner or "TOPLEFT"
+    local x = corner:find("RIGHT") and frame:GetRight() or frame:GetLeft()
+    local y = corner:find("BOTTOM") and frame:GetBottom() or frame:GetTop()
+    if not x or not y then return end
     local scale = frame:GetEffectiveScale() / UIParent:GetEffectiveScale()
-    SimpleSpellCDTrackerDB[key] = { "TOPLEFT", "BOTTOMLEFT", left * scale, top * scale }
+    db[key] = { corner, "BOTTOMLEFT", x * scale, y * scale }
 end
 
 local function ApplyPosition()
     ApplyFramePosition(container, "position", "CENTER", 0, -120)
 end
 
+-- Save where the bars are right now, using the current fixed corner.
 local function SavePosition()
-    SaveFramePosition(container, "position")
-    ApplyPosition() -- re-anchor at top-left right away
+    SaveFramePosition(container, "position", GetAnchorCorner())
+    ApplyPosition()
 end
 
 local function StartDrag()
-    if SimpleSpellCDTrackerDB and not SimpleSpellCDTrackerDB.locked then
+    if db and not db.locked then
         container:StartMoving()
     end
 end
 
 local function StopDrag()
     container:StopMovingOrSizing()
-    if SimpleSpellCDTrackerDB and not SimpleSpellCDTrackerDB.locked then
+    if db and not db.locked then
         SavePosition()
     end
 end
@@ -364,7 +510,7 @@ container:SetScript("OnDragStart", StartDrag)
 container:SetScript("OnDragStop", StopDrag)
 
 local function UpdateLockState()
-    local unlocked = not SimpleSpellCDTrackerDB.locked
+    local unlocked = not db.locked
     container:EnableMouse(unlocked)
     moverOutline:SetShown(unlocked)
     moverFill:SetShown(unlocked)
@@ -372,29 +518,48 @@ local function UpdateLockState()
     if UpdateVisibility then UpdateVisibility() end
 end
 
+-- While unlocked or while the options window is open, show every bar so the
+-- player can see what they're arranging.
+local function IsPreviewing()
+    return not db.locked or (optionsFrame ~= nil and optionsFrame:IsShown())
+end
+
+-------------------------------------------------------------------------------
+-- Bars
+-------------------------------------------------------------------------------
+-- Active cooldowns by entry key: { start = GetTime(), duration = seconds }.
+-- Filled from the game's cooldown data when it's readable, and from our own
+-- cast tracking when it isn't (in combat the game returns secret values).
+local cdState = {}
+local barPool = {}
+
 local function ShowBarTooltip(owner, item)
-    if not item.spell then return end
+    local entry = item.spell
+    if not entry then return end
     GameTooltip:SetOwner(owner, "ANCHOR_RIGHT")
     local shown = false
-    if item.spell.id and GameTooltip.SetSpellByID then
-        shown = pcall(GameTooltip.SetSpellByID, GameTooltip, item.spell.id)
+    if entry.type == "item" then
+        if GameTooltip.SetItemByID then
+            shown = pcall(GameTooltip.SetItemByID, GameTooltip, entry.id)
+        end
+    elseif entry.id and GameTooltip.SetSpellByID then
+        shown = pcall(GameTooltip.SetSpellByID, GameTooltip, entry.id)
     end
     if not shown then
         GameTooltip:ClearLines()
-        GameTooltip:AddLine(item.spell.name, 1, 1, 1)
+        GameTooltip:AddLine(entry.name, 1, 1, 1)
     end
     if item.available == false then
-        GameTooltip:AddLine("You don't currently have this spell.", DANGER[1], DANGER[2], DANGER[3])
+        local what = entry.type == "item" and "You don't have this item." or "You don't currently have this spell."
+        GameTooltip:AddLine(what, DANGER[1], DANGER[2], DANGER[3])
     end
     GameTooltip:AddLine(" ")
     GameTooltip:AddLine("Right-click for options", TEXT_DIM[1], TEXT_DIM[2], TEXT_DIM[3])
-    if not SimpleSpellCDTrackerDB.locked then
+    if not db.locked then
         GameTooltip:AddLine("Drag to move", TEXT_DIM[1], TEXT_DIM[2], TEXT_DIM[3])
     end
     GameTooltip:Show()
 end
-
-local barPool = {}
 
 local function CreateBar()
     local item = {}
@@ -410,7 +575,8 @@ local function CreateBar()
     holder:SetScript("OnEnter", function(self) ShowBarTooltip(self, item) end)
     holder:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
-    -- 1px black frame around icon and bar, also the separator between them.
+    -- 1px frame around icon and bar, also the separator between them. In icon
+    -- style it takes the state colour.
     item.edge = holder:CreateTexture(nil, "BACKGROUND", nil, -8)
     item.edge:SetAllPoints(holder)
 
@@ -442,68 +608,160 @@ local function CreateBar()
     item.spark:SetPoint("CENTER", item.bar:GetStatusBarTexture(), "RIGHT", 0, 0)
     item.spark:Hide()
 
+    -- Text and effects sit above the bar and the cooldown swipe.
     local textLayer = CreateFrame("Frame", nil, holder)
-    textLayer:SetAllPoints(item.bar)
-    textLayer:SetFrameLevel(item.bar:GetFrameLevel() + 2)
+    textLayer:SetAllPoints(holder)
+    textLayer:SetFrameLevel(holder:GetFrameLevel() + 5)
 
     item.time = CreateText(textLayer, 11, TEXT_MAIN, "OUTLINE")
-    item.time:SetPoint("RIGHT", textLayer, "RIGHT", -6, 0)
-    item.time:SetJustifyH("RIGHT")
-
     item.name = CreateText(textLayer, 11, TEXT_MAIN, "OUTLINE")
-    item.name:SetPoint("LEFT", textLayer, "LEFT", 6, 0)
-    item.name:SetPoint("RIGHT", item.time, "LEFT", -4, 0)
     if item.name.SetWordWrap then item.name:SetWordWrap(false) end
+    item.charges = CreateText(textLayer, 10, TEXT_MAIN, "OUTLINE")
+    item.charges:SetJustifyH("RIGHT")
+
+    -- Ready flash: a quick white pulse over the whole bar.
+    item.flash = textLayer:CreateTexture(nil, "BACKGROUND")
+    item.flash:SetAllPoints(holder)
+    item.flash:SetColorTexture(1, 1, 1, 1)
+    item.flash:SetBlendMode("ADD")
+    item.flash:SetAlpha(0)
+    local anim = item.flash:CreateAnimationGroup()
+    for i = 1, 4 do
+        local a = anim:CreateAnimation("Alpha")
+        a:SetFromAlpha(i % 2 == 1 and 0 or 0.45)
+        a:SetToAlpha(i % 2 == 1 and 0.45 or 0)
+        a:SetDuration(0.18)
+        a:SetOrder(i)
+    end
+    anim:SetScript("OnFinished", function() item.flash:SetAlpha(0) end)
+    item.flashAnim = anim
 
     item.holder = holder
     return item
 end
 
-local function RebuildBars()
-    local db = SimpleSpellCDTrackerDB
-    local w, h, gap = db.barWidth, db.barHeight, db.spacing
-    local count = #db.spells
-    local fontSize = math.max(9, math.floor(h * 0.48 + 0.5))
+-- Position the bars that should be visible. Cheap to call every update: it
+-- only moves frames when the visible set changes (or when forced).
+local lastLayout
+local function LayoutBars(force)
+    local list = charDB.spells
+    local showAll = not db.onlyOnCooldown or IsPreviewing()
+    local visible, sig = {}, { showAll and "a" or "f" }
+    for i = 1, #list do
+        local item = barPool[i]
+        if item and item.spell then
+            local show = showAll or (item.available ~= false and cdState[item.key] ~= nil)
+            if show then
+                visible[#visible + 1] = item
+                sig[#sig + 1] = i
+            end
+            item.holder:SetShown(show)
+        end
+    end
+    local signature = table.concat(sig, ",")
+    if not force and signature == lastLayout then return end
+    lastLayout = signature
 
-    for i = count + 1, #barPool do
-        barPool[i].holder:Hide()
-        barPool[i].spell = nil
+    local iconMode = db.style == "icons"
+    local gap = db.spacing
+    local w, h = barPool[1] and barPool[1].holder:GetWidth() or db.barWidth, barPool[1] and barPool[1].holder:GetHeight() or db.barHeight
+    if not w or w == 0 then w = db.barWidth end
+    if not h or h == 0 then h = db.barHeight end
+    local corner = GetAnchorCorner()
+    local n = math.max(1, #visible)
+
+    if iconMode then
+        container:SetSize(n * (w + gap) - gap, h)
+    else
+        container:SetSize(w, n * (h + gap) - gap)
     end
 
-    container:SetSize(w, math.max(h, count * (h + gap) - gap))
+    for k, item in ipairs(visible) do
+        local offset = (k - 1) * ((iconMode and w or h) + gap)
+        item.holder:ClearAllPoints()
+        if iconMode then
+            if corner == "TOPRIGHT" then
+                item.holder:SetPoint("TOPRIGHT", container, "TOPRIGHT", -offset, 0)
+            else
+                item.holder:SetPoint("TOPLEFT", container, "TOPLEFT", offset, 0)
+            end
+        elseif corner == "BOTTOMLEFT" then
+            item.holder:SetPoint("BOTTOMLEFT", container, "BOTTOMLEFT", 0, offset)
+        else
+            item.holder:SetPoint("TOPLEFT", container, "TOPLEFT", 0, -offset)
+        end
+    end
+end
 
-    for i, entry in ipairs(db.spells) do
+-- Apply the current settings to every bar (size, style, icons, fonts).
+local function ConfigureBars()
+    local list = charDB.spells
+    local iconMode = db.style == "icons"
+    local h = db.barHeight
+    local size = iconMode and math.floor(h * 1.4 + 0.5) or h
+    local fontSize = iconMode and math.max(9, math.floor(size * 0.36 + 0.5)) or math.max(9, math.floor(h * 0.48 + 0.5))
+
+    for i = #list + 1, #barPool do
+        barPool[i].holder:Hide()
+        barPool[i].spell = nil
+        barPool[i].key = nil
+    end
+
+    for i, entry in ipairs(list) do
         local item = barPool[i]
         if not item then
             item = CreateBar()
             barPool[i] = item
         end
         item.spell = entry
+        item.key = EntryKey(entry)
         item.cdStart = nil -- force the icon swipe to refresh
-        item.available = IsSpellAvailable(entry)
+        item.wasCooling = nil -- no ready alert right after (re)configuring
+        item.available = IsEntryAvailable(entry)
 
-        local holder = item.holder
-        holder:SetSize(w, h)
-        holder:ClearAllPoints()
-        holder:SetPoint("TOPLEFT", container, "TOPLEFT", 0, -((i - 1) * (h + gap)))
-
+        item.holder:SetSize(iconMode and size or db.barWidth, size)
         item.edge:SetColorTexture(0, 0, 0, db.bgAlpha)
 
-        item.bar:ClearAllPoints()
-        if db.showIcons then
-            item.icon:ClearAllPoints()
-            item.icon:SetPoint("TOPLEFT", holder, "TOPLEFT", 1, -1)
-            item.icon:SetSize(h - 2, h - 2)
-            item.icon:SetTexture(GetSpellIcon(entry))
+        local showIcon = iconMode or db.showIcons
+        item.icon:ClearAllPoints()
+        if showIcon then
+            item.icon:SetPoint("TOPLEFT", item.holder, "TOPLEFT", 1, -1)
+            item.icon:SetSize(size - 2, size - 2)
+            item.icon:SetTexture(GetEntryIcon(entry))
             item.icon:Show()
             item.cooldown:Show()
-            item.bar:SetPoint("TOPLEFT", item.icon, "TOPRIGHT", 1, 0)
         else
             item.icon:Hide()
             item.cooldown:Hide()
-            item.bar:SetPoint("TOPLEFT", holder, "TOPLEFT", 1, -1)
         end
-        item.bar:SetPoint("BOTTOMRIGHT", holder, "BOTTOMRIGHT", -1, 1)
+
+        item.bar:ClearAllPoints()
+        item.time:ClearAllPoints()
+        item.name:ClearAllPoints()
+        if iconMode then
+            item.bar:Hide()
+            item.bg:Hide()
+            item.name:Hide()
+            item.time:SetPoint("CENTER", item.icon, "CENTER", 0, 0)
+            item.time:SetJustifyH("CENTER")
+        else
+            if showIcon then
+                item.bar:SetPoint("TOPLEFT", item.icon, "TOPRIGHT", 1, 0)
+            else
+                item.bar:SetPoint("TOPLEFT", item.holder, "TOPLEFT", 1, -1)
+            end
+            item.bar:SetPoint("BOTTOMRIGHT", item.holder, "BOTTOMRIGHT", -1, 1)
+            item.bar:Show()
+            item.bg:Show()
+            item.name:Show()
+            item.time:SetPoint("RIGHT", item.bar, "RIGHT", -6, 0)
+            item.time:SetJustifyH("RIGHT")
+            item.name:SetPoint("LEFT", item.bar, "LEFT", 6, 0)
+            item.name:SetPoint("RIGHT", item.time, "LEFT", -4, 0)
+        end
+
+        item.charges:ClearAllPoints()
+        item.charges:SetPoint("BOTTOMRIGHT", item.icon, "BOTTOMRIGHT", -1, 2)
 
         item.bar:SetAlpha(db.barAlpha)
         item.icon:SetAlpha(db.barAlpha)
@@ -513,79 +771,110 @@ local function RebuildBars()
 
         item.name:SetFont(FONT, fontSize, "OUTLINE")
         item.time:SetFont(FONT, fontSize, "OUTLINE")
+        item.charges:SetFont(FONT, math.max(8, fontSize - 1), "OUTLINE")
         item.name:SetText(entry.name)
-
-        holder:Show()
     end
 
+    LayoutBars(true)
     UpdateLockState()
 end
 
--- Called when the spellbook changes (login, spec swap, new spell learned):
--- icons may have loaded and spells may have become available or unavailable.
-local function RefreshSpellInfo()
-    for i = 1, #SimpleSpellCDTrackerDB.spells do
+-- Called when the spellbook, bags or equipment change: icons may have loaded
+-- and spells/items may have become available or unavailable.
+local function RefreshEntryInfo()
+    for i = 1, #charDB.spells do
         local item = barPool[i]
         if item and item.spell then
-            item.available = IsSpellAvailable(item.spell)
-            if SimpleSpellCDTrackerDB.showIcons then
-                item.icon:SetTexture(GetSpellIcon(item.spell))
+            item.available = IsEntryAvailable(item.spell)
+            if item.icon:IsShown() then
+                item.icon:SetTexture(GetEntryIcon(item.spell))
+            end
+            if item.spell.type == "item" and not item.spell.spellID then
+                local ok, spellID = pcall(GetItemUseSpell, item.spell.id)
+                if ok and IsNumber(spellID) then item.spell.spellID = spellID end
             end
         end
     end
+    LayoutBars(true)
 end
 
 -------------------------------------------------------------------------------
 -- Cooldown tracking
 -------------------------------------------------------------------------------
--- Active cooldowns by spell name: { start = GetTime(), duration = seconds }.
--- Filled from the game's cooldown data when it's readable, and from our own
--- cast tracking when it isn't (in combat the game returns secret values).
-local cdState = {}
-
 local function OnPlayerSpellCast(spellID)
     if not spellID or IsSecret(spellID) then return end
     local castName = GetSpellNameByID(spellID)
     if IsSecret(castName) then castName = nil end
-    for _, entry in ipairs(SimpleSpellCDTrackerDB.spells) do
-        if entry.id == spellID or (castName and castName == entry.name) then
-            local duration = SimpleSpellCDTrackerDB.knownDurations[entry.name] or GetBaseCooldown(spellID)
+    for _, entry in ipairs(charDB.spells) do
+        local match
+        if entry.type == "item" then
+            match = entry.spellID == spellID
+        else
+            match = entry.id == spellID or (castName ~= nil and castName == entry.name)
+        end
+        if match then
+            local key = EntryKey(entry)
+            local duration = charDB.knownDurations[key] or GetBaseCooldown(spellID)
             if duration and duration > 2 then
-                cdState[entry.name] = { start = GetTime(), duration = duration }
+                cdState[key] = { start = GetTime(), duration = duration }
             end
         end
     end
 end
 
 local function UpdateBars()
-    local db = SimpleSpellCDTrackerDB
     local now = GetTime()
     local cReady, cCool, cWarn = db.colors.ready, db.colors.cooldown, db.colors.warning
+    local iconMode = db.style == "icons"
+    local playSound = false
 
-    for i = 1, #db.spells do
+    for i = 1, #charDB.spells do
         local item = barPool[i]
         local entry = item and item.spell
         if entry then
+            local key = item.key
             local startTime, duration, enabled = ReadCooldown(entry)
             if startTime then
                 local isEnabled = (enabled == 1 or enabled == true or enabled == nil)
-                if isEnabled and duration > 2 and startTime > 0 then
-                    cdState[entry.name] = { start = startTime, duration = duration }
-                    db.knownDurations[entry.name] = duration
+                if not isEnabled then
+                    -- Cooldown is waiting to start (e.g. a potion used in
+                    -- combat): keep whatever we're already showing.
+                elseif duration > 2 and startTime > 0 then
+                    cdState[key] = { start = startTime, duration = duration }
+                    charDB.knownDurations[key] = duration
                 else
-                    cdState[entry.name] = nil
+                    cdState[key] = nil
                 end
             end
 
-            local state = cdState[entry.name]
+            local state = cdState[key]
             local remaining = 0
             if state then
                 remaining = state.start + state.duration - now
                 if remaining <= 0 then
-                    cdState[entry.name] = nil
+                    cdState[key] = nil
                     state = nil
                 end
             end
+
+            -- Ready alert when a cooldown finishes.
+            local cooling = state ~= nil
+            if item.wasCooling and not cooling and entry.alert and item.available ~= false then
+                if db.alertFlash then
+                    item.flashAnim:Stop()
+                    item.flashAnim:Play()
+                end
+                if db.alertSound then playSound = true end
+            end
+            item.wasCooling = cooling
+
+            local charges = GetCharges(entry)
+            local nameText = entry.name
+            if charges and not item.icon:IsShown() then
+                nameText = nameText .. " (" .. charges .. ")"
+            end
+            item.name:SetText(nameText)
+            item.charges:SetText(charges and item.icon:IsShown() and tostring(charges) or "")
 
             local c
             if item.available == false then
@@ -597,19 +886,15 @@ local function UpdateBars()
                 item.name:SetTextColor(TEXT_DIM[1], TEXT_DIM[2], TEXT_DIM[3])
                 if item.cdStart ~= 0 then
                     item.cdStart = 0
-                    if item.cooldown.Clear then
-                        item.cooldown:Clear()
-                    else
-                        item.cooldown:SetCooldown(0, 0)
-                    end
+                    ClearCooldown(item.cooldown)
                 end
             elseif state then
-                item.name:SetTextColor(TEXT_MAIN[1], TEXT_MAIN[2], TEXT_MAIN[3])
                 local progress = math.min(1, math.max(0, 1 - remaining / state.duration))
                 c = remaining <= 60 and cWarn or cCool
+                item.name:SetTextColor(TEXT_MAIN[1], TEXT_MAIN[2], TEXT_MAIN[3])
                 item.bar:SetValue(progress)
                 item.time:SetText(FormatTime(remaining))
-                item.spark:SetShown(progress > 0.005 and progress < 0.995)
+                item.spark:SetShown(not iconMode and progress > 0.005 and progress < 0.995)
                 item.icon:SetDesaturated(true)
                 if item.cdStart ~= state.start then
                     item.cdStart = state.start
@@ -624,22 +909,28 @@ local function UpdateBars()
                 item.icon:SetDesaturated(false)
                 if item.cdStart ~= 0 then
                     item.cdStart = 0
-                    if item.cooldown.Clear then
-                        item.cooldown:Clear()
-                    else
-                        item.cooldown:SetCooldown(0, 0)
-                    end
+                    ClearCooldown(item.cooldown)
                 end
             end
 
-            item.bar:SetStatusBarColor(c[1], c[2], c[3], 1)
-            item.bg:SetColorTexture(c[1] * 0.2, c[2] * 0.2, c[3] * 0.2, db.bgAlpha)
+            if iconMode then
+                item.edge:SetColorTexture(c[1], c[2], c[3], db.barAlpha)
+            else
+                item.bar:SetStatusBarColor(c[1], c[2], c[3], 1)
+                item.bg:SetColorTexture(c[1] * 0.2, c[2] * 0.2, c[3] * 0.2, db.bgAlpha)
+            end
         end
     end
+
+    if playSound and PlaySound then
+        pcall(PlaySound, ALERT_SOUND, "Master")
+    end
+
+    LayoutBars(false)
 end
 
 -------------------------------------------------------------------------------
--- Spell search
+-- Search: spells and items
 -------------------------------------------------------------------------------
 -- Calls callback(name, spellID, isPassive) for each spell in the spellbook.
 local function ForEachSpellbookSpell(callback)
@@ -673,6 +964,26 @@ local function ForEachSpellbookSpell(callback)
                     local isPassive = IsPassiveSpell and IsPassiveSpell(s, "spell")
                     callback(name, spellID, isPassive)
                 end
+            end
+        end
+    end
+end
+
+-- Calls callback(itemID) for every item the player is wearing or carrying.
+local function ForEachOwnedItem(callback)
+    if GetInventoryItemID then
+        for slot = 1, 19 do
+            local id = GetInventoryItemID("player", slot)
+            if id then callback(id) end
+        end
+    end
+    local numSlots = (C_Container and C_Container.GetContainerNumSlots) or GetContainerNumSlots
+    local itemAt = (C_Container and C_Container.GetContainerItemID) or GetContainerItemID
+    if numSlots and itemAt then
+        for bag = 0, 4 do
+            for slot = 1, numSlots(bag) or 0 do
+                local id = itemAt(bag, slot)
+                if id then callback(id) end
             end
         end
     end
@@ -721,28 +1032,44 @@ local function StartSpellIndex()
     if not indexDone then indexer:Show() end
 end
 
-local function SearchSpells(filterText)
+local function SearchEntries(filterText)
     local results, seen = {}, {}
     local query = string.lower(filterText or "")
+    local function Matches(name)
+        return query == "" or string.find(string.lower(name), query, 1, true) ~= nil
+    end
 
     -- 1. Spellbook: with no query, list spells that have a real cooldown.
     ForEachSpellbookSpell(function(name, spellID, isPassive)
         if seen[name] or isPassive then return end
         local base = GetBaseCooldown(spellID)
         local hasCooldown = (not GetSpellBaseCooldown) or (base and base > 0)
-        if (query == "" and hasCooldown) or (query ~= "" and string.find(string.lower(name), query, 1, true)) then
+        if (query == "" and hasCooldown) or (query ~= "" and Matches(name)) then
             seen[name] = true
             table.insert(results, { name = name, id = spellID })
         end
     end)
 
-    -- 2. Any spell with a cooldown, from the background index, once the query
+    -- 2. Usable items the player is wearing or carrying.
+    ForEachOwnedItem(function(itemID)
+        local key = "item:" .. itemID
+        if seen[key] then return end
+        local spellID = GetItemUseSpell(itemID)
+        if not spellID then return end
+        local name = GetItemName(itemID)
+        if name and Matches(name) then
+            seen[key] = true
+            table.insert(results, { type = "item", id = itemID, name = name, spellID = spellID })
+        end
+    end)
+
+    -- 3. Any spell with a cooldown, from the background index, once the query
     --    has 2+ characters.
     if string.len(query) >= 2 then
         for i = 1, #indexNames do
             if #results >= MAX_SEARCH_RESULTS then break end
             local name = indexNames[i]
-            if not seen[name] and string.find(string.lower(name), query, 1, true) then
+            if not seen[name] and Matches(name) then
                 seen[name] = true
                 table.insert(results, { name = name, id = indexIDs[i] })
             end
@@ -754,9 +1081,9 @@ local function SearchSpells(filterText)
 end
 
 -- Returns the results, or nil if the search couldn't run (e.g. the game is
--- hiding spell data in combat).
-local function GetSearchableSpells(filterText)
-    local ok, results = pcall(SearchSpells, filterText)
+-- hiding data in combat).
+local function GetSearchResults(filterText)
+    local ok, results = pcall(SearchEntries, filterText)
     if ok then return results end
     return nil
 end
@@ -764,6 +1091,13 @@ end
 -------------------------------------------------------------------------------
 -- Options widgets
 -------------------------------------------------------------------------------
+local function ShowTooltip(owner, text)
+    if not text then return end
+    GameTooltip:SetOwner(owner, "ANCHOR_RIGHT")
+    GameTooltip:SetText(text, 1, 1, 1, 1, true)
+    GameTooltip:Show()
+end
+
 local function CreateFlatButton(parent, text, w, h)
     local b = CreateFrame("Button", nil, parent)
     b:SetSize(w, h)
@@ -773,14 +1107,47 @@ local function CreateFlatButton(parent, text, w, h)
     b.label:SetJustifyH("CENTER")
     b.label:SetText(text)
     b.hoverColor = ACCENT
+    b.restColor = PANEL_BORDER
     b:SetScript("OnEnter", function(self)
         if self:IsEnabled() then SetTexColor(self.borderTex, self.hoverColor) end
+        ShowTooltip(self, self.tooltip)
     end)
-    b:SetScript("OnLeave", function(self) SetTexColor(self.borderTex, PANEL_BORDER) end)
+    b:SetScript("OnLeave", function(self)
+        SetTexColor(self.borderTex, self.restColor)
+        GameTooltip:Hide()
+    end)
     b:SetScript("OnMouseDown", function(self)
         if self:IsEnabled() then self.label:SetPoint("CENTER", self, "CENTER", 1, -1) end
     end)
     b:SetScript("OnMouseUp", function(self) self.label:SetPoint("CENTER", self, "CENTER", 0, 0) end)
+    return b
+end
+
+local function SetButtonEnabled(btn, enabled)
+    if enabled then
+        btn:Enable()
+        btn.label:SetTextColor(TEXT_MAIN[1], TEXT_MAIN[2], TEXT_MAIN[3])
+    else
+        btn:Disable()
+        btn.label:SetTextColor(TEXT_DIM[1], TEXT_DIM[2], TEXT_DIM[3])
+    end
+    if btn.arrow then
+        local c = enabled and TEXT_MAIN or UNAVAILABLE
+        for _, t in ipairs(btn.arrow) do SetTexColor(t, c) end
+    end
+end
+
+-- Small arrow drawn from flat strips, so it looks the same on every client.
+local function CreateArrowButton(parent, up)
+    local b = CreateFlatButton(parent, "", 18, 18)
+    b.arrow = {}
+    for i = 1, 4 do
+        local t = b:CreateTexture(nil, "ARTWORK")
+        t:SetSize(i * 2 - 1, 1)
+        t:SetPoint("CENTER", b, "CENTER", 0, up and (2 - i) or (i - 3))
+        SetTexColor(t, TEXT_MAIN)
+        b.arrow[i] = t
+    end
     return b
 end
 
@@ -796,7 +1163,7 @@ local function CreateSectionHeader(parent, text, y, rightInset)
     return fs
 end
 
-local function CreateCheckbox(parent, label, getter, setter)
+local function CreateCheckbox(parent, label, getter, setter, tooltip)
     local b = CreateFrame("Button", nil, parent)
     b:SetSize(120, 18)
     local box = CreateFrame("Frame", nil, b)
@@ -820,8 +1187,14 @@ local function CreateCheckbox(parent, label, getter, setter)
         setter(not getter())
         self:Refresh()
     end)
-    b:SetScript("OnEnter", function() SetTexColor(border, ACCENT) end)
-    b:SetScript("OnLeave", function() SetTexColor(border, WIDGET_BORDER) end)
+    b:SetScript("OnEnter", function(self)
+        SetTexColor(border, ACCENT)
+        ShowTooltip(self, tooltip)
+    end)
+    b:SetScript("OnLeave", function()
+        SetTexColor(border, WIDGET_BORDER)
+        GameTooltip:Hide()
+    end)
     b:Refresh()
     return b
 end
@@ -905,18 +1278,18 @@ local function CreateColorSwatch(parent, labelText, colorKey)
     text:SetText(labelText)
 
     function b:Refresh()
-        SetTexColor(swatch, SimpleSpellCDTrackerDB.colors[colorKey])
+        SetTexColor(swatch, db.colors[colorKey])
     end
 
     local function ApplyColor(r, g, bl)
-        SimpleSpellCDTrackerDB.colors[colorKey] = { r, g, bl }
+        db.colors[colorKey] = SanitizeColor({ r, g, bl }, DEFAULTS.colors[colorKey])
         b:Refresh()
     end
 
     b:SetScript("OnEnter", function() SetTexColor(border, ACCENT) end)
     b:SetScript("OnLeave", function() SetTexColor(border, WIDGET_BORDER) end)
     b:SetScript("OnClick", function()
-        local cur = SimpleSpellCDTrackerDB.colors[colorKey]
+        local cur = db.colors[colorKey]
         local prevR, prevG, prevB = cur[1], cur[2], cur[3]
 
         if ColorPickerFrame.SetupColorPickerAndShow then
@@ -949,6 +1322,36 @@ local function CreateColorSwatch(parent, labelText, colorKey)
     return b
 end
 
+-- Two-or-more-way choice shown as joined buttons; the selected one is lit.
+local function CreateSegmented(parent, options, getter, setter)
+    local holder = CreateFrame("Frame", nil, parent)
+    holder:SetSize(#options * 52, 20)
+    local buttons = {}
+    for i, opt in ipairs(options) do
+        local b = CreateFlatButton(holder, opt.label, 52, 20)
+        b:SetPoint("LEFT", holder, "LEFT", (i - 1) * 51, 0)
+        b:SetScript("OnClick", function()
+            if getter() ~= opt.value then
+                setter(opt.value)
+                holder:Refresh()
+            end
+        end)
+        buttons[i] = b
+    end
+    function holder:Refresh()
+        for i, opt in ipairs(options) do
+            local b = buttons[i]
+            local on = getter() == opt.value
+            b.restColor = on and ACCENT or PANEL_BORDER
+            SetTexColor(b.borderTex, b.restColor)
+            local c = on and ACCENT or TEXT_MAIN
+            b.label:SetTextColor(c[1], c[2], c[3])
+        end
+    end
+    holder:Refresh()
+    return holder
+end
+
 local function FormatPercent(v)
     return string.format("%d%%", math.floor(v * 100 + 0.5))
 end
@@ -960,14 +1363,11 @@ end
 -------------------------------------------------------------------------------
 -- Options panel
 -------------------------------------------------------------------------------
-local optionsFrame
-
 local function CreateOptionsPanel()
-    local db = SimpleSpellCDTrackerDB
     local controls = {}
 
     local f = CreateFrame("Frame", "SimpleSpellCDTrackerOptions", UIParent)
-    f:SetSize(360, 562)
+    f:SetSize(360, 576)
     ApplyFramePosition(f, "optionsPosition", "CENTER", 0, 40)
     f:SetFrameStrata("DIALOG")
     f:SetClampedToScreen(true)
@@ -1003,7 +1403,7 @@ local function CreateOptionsPanel()
 
     local title = CreateText(titleBar, 14, ACCENT)
     title:SetPoint("LEFT", titleBar, "LEFT", 12, 0)
-    title:SetText("Simple Spell CD Tracker")
+    title:SetText(ADDON_TITLE)
     local version = GetVersion()
     local subtitle = CreateText(titleBar, 11, TEXT_DIM)
     subtitle:SetPoint("LEFT", title, "RIGHT", 6, -1)
@@ -1014,33 +1414,23 @@ local function CreateOptionsPanel()
     closeBtn.hoverColor = DANGER
     closeBtn:SetScript("OnClick", function() f:Hide() end)
 
+    local function AddCheckbox(label, key, x, y, onChange, tooltip)
+        local cb = CreateCheckbox(f, label, function() return db[key] end, function(v)
+            db[key] = v
+            if onChange then onChange() end
+        end, tooltip)
+        cb:SetPoint("TOPLEFT", f, "TOPLEFT", x, y)
+        table.insert(controls, cb)
+        return cb
+    end
+
     -- General
     CreateSectionHeader(f, "General", -46)
 
-    local lockCheck = CreateCheckbox(f, "Lock bars", function() return db.locked end, function(v)
-        db.locked = v
-        UpdateLockState()
-    end)
-    lockCheck:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -66)
-    table.insert(controls, lockCheck)
-
-    local iconCheck = CreateCheckbox(f, "Show spell icons", function() return db.showIcons end, function(v)
-        db.showIcons = v
-        RebuildBars()
-    end)
-    iconCheck:SetPoint("TOPLEFT", f, "TOPLEFT", 112, -66)
-    table.insert(controls, iconCheck)
-
-    local combatCheck = CreateCheckbox(f, "Hide out of combat", function() return db.hideOutOfCombat end, function(v)
-        db.hideOutOfCombat = v
-        UpdateVisibility()
-    end)
-    combatCheck:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -88)
-    table.insert(controls, combatCheck)
-
-    local combatHint = CreateText(f, 10, TEXT_DIM)
-    combatHint:SetPoint("LEFT", combatCheck, "RIGHT", 8, 0)
-    combatHint:SetText("(always shown while unlocked)")
+    AddCheckbox("Lock bars", "locked", 16, -66, UpdateLockState,
+        "Untick to drag the bars somewhere else.")
+    AddCheckbox("Show spell icons", "showIcons", 112, -66, ConfigureBars,
+        "Show the spell or item icon at the left of each bar.")
 
     local resetBtn = CreateFlatButton(f, "Reset Position", 100, 20)
     resetBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -16, -65)
@@ -1049,35 +1439,51 @@ local function CreateOptionsPanel()
         ApplyPosition()
     end)
 
+    AddCheckbox("Hide out of combat", "hideOutOfCombat", 16, -88, function() UpdateVisibility() end,
+        "Only show the bars in combat.\nThey still show while unlocked or while this window is open.")
+    AddCheckbox("Show only on cooldown", "onlyOnCooldown", 160, -88, function() LayoutBars(true) end,
+        "Hide bars for spells that are ready.\nAll bars still show while unlocked or while this window is open.")
+
+    AddCheckbox("Alert sound", "alertSound", 16, -110, nil,
+        "Play a sound when a cooldown with alerts on becomes ready.\nTurn alerts on per spell in the list below.")
+    AddCheckbox("Alert flash", "alertFlash", 112, -110, nil,
+        "Flash the bar when a cooldown with alerts on becomes ready.\nTurn alerts on per spell in the list below.")
+
     -- Appearance
-    CreateSectionHeader(f, "Appearance", -122)
+    CreateSectionHeader(f, "Appearance", -140)
 
-    local widthSlider = CreateSlider(f, "Bar Width", 120, 320, 5, FormatPixels,
-        function() return db.barWidth end,
-        function(v) db.barWidth = v; RebuildBars() end)
-    widthSlider:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -140)
-    table.insert(controls, widthSlider)
+    local styleLabel = CreateText(f, 11, TEXT_DIM)
+    styleLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -162)
+    styleLabel:SetText("Style")
+    local style = CreateSegmented(f, { { label = "Bars", value = "bars" }, { label = "Icons", value = "icons" } },
+        function() return db.style end,
+        function(v)
+            db.style = v
+            ConfigureBars()
+            SavePosition() -- keep the fixed corner where it is for the new style
+        end)
+    style:SetPoint("TOPLEFT", f, "TOPLEFT", 52, -158)
+    table.insert(controls, style)
 
-    local heightSlider = CreateSlider(f, "Bar Height", 14, 40, 1, FormatPixels,
-        function() return db.barHeight end,
-        function(v) db.barHeight = v; RebuildBars() end)
-    heightSlider:SetPoint("TOPLEFT", f, "TOPLEFT", 188, -140)
-    table.insert(controls, heightSlider)
+    AddCheckbox("Reverse direction", "reverse", 188, -159, function()
+        SavePosition() -- re-anchor on the new fixed corner without moving
+        LayoutBars(true)
+    end, "Bars grow upward instead of down.\nIcons grow to the left instead of right.")
 
-    local barAlphaSlider = CreateSlider(f, "Bar Opacity", 0.05, 1.0, 0.05, FormatPercent,
-        function() return db.barAlpha end,
-        function(v) db.barAlpha = v; RebuildBars() end)
-    barAlphaSlider:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -182)
-    table.insert(controls, barAlphaSlider)
-
-    local bgAlphaSlider = CreateSlider(f, "Background Opacity", 0, 1.0, 0.05, FormatPercent,
-        function() return db.bgAlpha end,
-        function(v) db.bgAlpha = v; RebuildBars() end)
-    bgAlphaSlider:SetPoint("TOPLEFT", f, "TOPLEFT", 188, -182)
-    table.insert(controls, bgAlphaSlider)
+    local function AddSlider(label, key, x, y, minV, maxV, step, formatter)
+        local s = CreateSlider(f, label, minV, maxV, step, formatter,
+            function() return db[key] end,
+            function(v) db[key] = v; ConfigureBars() end)
+        s:SetPoint("TOPLEFT", f, "TOPLEFT", x, y)
+        table.insert(controls, s)
+    end
+    AddSlider("Bar Width", "barWidth", 16, -186, 120, 320, 5, FormatPixels)
+    AddSlider("Bar / Icon Size", "barHeight", 188, -186, 14, 40, 1, FormatPixels)
+    AddSlider("Bar Opacity", "barAlpha", 16, -228, 0.05, 1.0, 0.05, FormatPercent)
+    AddSlider("Background Opacity", "bgAlpha", 188, -228, 0, 1.0, 0.05, FormatPercent)
 
     -- Colors
-    CreateSectionHeader(f, "Colors", -230)
+    CreateSectionHeader(f, "Colors", -276)
     local swatches = {
         { "Ready", "ready", 16 },
         { "Cooldown", "cooldown", 128 },
@@ -1085,19 +1491,19 @@ local function CreateOptionsPanel()
     }
     for _, s in ipairs(swatches) do
         local sw = CreateColorSwatch(f, s[1], s[2])
-        sw:SetPoint("TOPLEFT", f, "TOPLEFT", s[3], -248)
+        sw:SetPoint("TOPLEFT", f, "TOPLEFT", s[3], -294)
         table.insert(controls, sw)
     end
 
     -- Tracked cooldowns
-    CreateSectionHeader(f, "Tracked Cooldowns", -284, 16 + 64 + 8)
+    CreateSectionHeader(f, "Tracked Cooldowns", -330, 16 + 64 + 8)
 
     local addBtn = CreateFlatButton(f, "+ Add", 64, 20)
-    addBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -16, -278)
+    addBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -16, -324)
 
     local searchBox = CreateFrame("EditBox", nil, f)
     searchBox:SetSize(328, 22)
-    searchBox:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -304)
+    searchBox:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -350)
     searchBox:SetAutoFocus(false)
     searchBox:SetFont(FONT, 12, "")
     searchBox:SetTextColor(TEXT_MAIN[1], TEXT_MAIN[2], TEXT_MAIN[3])
@@ -1106,7 +1512,7 @@ local function CreateOptionsPanel()
     local _, searchBorder = AddBackdrop(searchBox, { 0.03, 0.03, 0.04, 1 }, WIDGET_BORDER)
     local placeholder = CreateText(searchBox, 12, TEXT_DIM)
     placeholder:SetPoint("LEFT", searchBox, "LEFT", 8, 0)
-    placeholder:SetText("Search spells by name...")
+    placeholder:SetText("Search spells and items...")
     searchBox:SetScript("OnEditFocusGained", function() SetTexColor(searchBorder, ACCENT) end)
     searchBox:SetScript("OnEditFocusLost", function() SetTexColor(searchBorder, WIDGET_BORDER) end)
     searchBox:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
@@ -1151,43 +1557,56 @@ local function CreateOptionsPanel()
         row.icon:SetPoint("LEFT", row, "LEFT", 4, 0)
         row.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 
-        row.btn = CreateFlatButton(row, "", 60, 18)
+        row.btn = CreateFlatButton(row, "", 56, 18)
         row.btn:SetPoint("RIGHT", row, "RIGHT", -3, 0)
+
+        row.downBtn = CreateArrowButton(row, false)
+        row.downBtn:SetPoint("RIGHT", row.btn, "LEFT", -3, 0)
+        row.downBtn.tooltip = "Move down"
+        row.upBtn = CreateArrowButton(row, true)
+        row.upBtn:SetPoint("RIGHT", row.downBtn, "LEFT", -2, 0)
+        row.upBtn.tooltip = "Move up"
+        row.alertBtn = CreateFlatButton(row, "Alert", 40, 18)
+        row.alertBtn:SetPoint("RIGHT", row.upBtn, "LEFT", -3, 0)
+        row.alertBtn.tooltip = "Alert when this cooldown is ready\n(sound and/or flash, set under General)"
 
         row.sub = CreateText(row, 10, TEXT_DIM)
         row.sub:SetPoint("RIGHT", row.btn, "LEFT", -8, 0)
         row.sub:SetJustifyH("RIGHT")
 
         row.text = CreateText(row, 11, TEXT_MAIN)
-        row.text:SetPoint("LEFT", row.icon, "RIGHT", 8, 0)
-        row.text:SetPoint("RIGHT", row.sub, "LEFT", -6, 0)
         if row.text.SetWordWrap then row.text:SetWordWrap(false) end
 
         rows[i] = row
     end
 
-    local searchMode, offset, entries = false, 0, db.spells
+    local searchMode, offset, entries = false, 0, charDB.spells
     local searchFailed = false
     local RefreshList
 
-    local function IsTracked(name)
-        for _, sp in ipairs(db.spells) do
-            if sp.name == name then return true end
+    local function IsTracked(entry)
+        local key = EntryKey(entry)
+        for _, e in ipairs(charDB.spells) do
+            if EntryKey(e) == key then return true end
         end
         return false
     end
 
-    local function SetButtonEnabled(btn, enabled)
-        if enabled then
-            btn:Enable()
-            btn.label:SetTextColor(TEXT_MAIN[1], TEXT_MAIN[2], TEXT_MAIN[3])
-        else
-            btn:Disable()
-            btn.label:SetTextColor(TEXT_DIM[1], TEXT_DIM[2], TEXT_DIM[3])
-        end
+    local function ListChanged()
+        charDB.migrated = true -- the player has their own list now
+        ConfigureBars()
+        RefreshList()
+    end
+
+    local function SetAlertLook(btn, on)
+        btn.restColor = on and ACCENT or PANEL_BORDER
+        SetTexColor(btn.borderTex, btn.restColor)
+        local c = on and ACCENT or TEXT_DIM
+        btn.label:SetTextColor(c[1], c[2], c[3])
     end
 
     RefreshList = function()
+        if not searchMode then entries = charDB.spells end
         local maxOffset = math.max(0, #entries - LIST_ROWS)
         offset = math.min(math.max(0, offset), maxOffset)
 
@@ -1196,33 +1615,73 @@ local function CreateOptionsPanel()
             local idx = offset + i
             local entry = entries[idx]
             if entry then
-                row.icon:SetTexture(GetSpellIcon(entry))
+                row.icon:SetTexture(GetEntryIcon(entry))
                 row.text:SetText(entry.name)
-                row.sub:SetText(entry.id and ("#" .. entry.id) or "")
+                row.text:ClearAllPoints()
+                row.text:SetPoint("LEFT", row.icon, "RIGHT", 8, 0)
                 if searchMode then
-                    local tracked = IsTracked(entry.name)
+                    row.sub:SetText(entry.type == "item" and "Item" or (entry.id and ("#" .. entry.id) or ""))
+                    row.sub:Show()
+                    row.alertBtn:Hide()
+                    row.upBtn:Hide()
+                    row.downBtn:Hide()
+                    row.text:SetPoint("RIGHT", row.sub, "LEFT", -6, 0)
+
+                    local tracked = IsTracked(entry)
                     row.btn.label:SetText(tracked and "Added" or "Add")
                     row.btn.hoverColor = ACCENT
                     SetButtonEnabled(row.btn, not tracked)
                     row.btn:SetScript("OnClick", function()
-                        if not IsTracked(entry.name) then
-                            table.insert(db.spells, { name = entry.name, id = entry.id })
-                            RebuildBars()
+                        if not IsTracked(entry) then
+                            table.insert(charDB.spells, {
+                                type = entry.type, id = entry.id, name = entry.name, spellID = entry.spellID,
+                            })
+                            ListChanged()
                         end
-                        RefreshList()
                     end)
                 else
+                    row.sub:Hide()
+                    row.alertBtn:Show()
+                    row.upBtn:Show()
+                    row.downBtn:Show()
+                    row.text:SetPoint("RIGHT", row.alertBtn, "LEFT", -6, 0)
+
+                    SetAlertLook(row.alertBtn, entry.alert)
+                    row.alertBtn:SetScript("OnClick", function()
+                        entry.alert = (not entry.alert) or nil
+                        SetAlertLook(row.alertBtn, entry.alert)
+                    end)
+
+                    SetButtonEnabled(row.upBtn, idx > 1)
+                    row.upBtn:SetScript("OnClick", function()
+                        local l = charDB.spells
+                        if idx > 1 then
+                            l[idx], l[idx - 1] = l[idx - 1], l[idx]
+                            if offset > 0 and i == 1 then offset = offset - 1 end
+                            ListChanged()
+                        end
+                    end)
+                    SetButtonEnabled(row.downBtn, idx < #entries)
+                    row.downBtn:SetScript("OnClick", function()
+                        local l = charDB.spells
+                        if idx < #l then
+                            l[idx], l[idx + 1] = l[idx + 1], l[idx]
+                            if i == LIST_ROWS then offset = offset + 1 end
+                            ListChanged()
+                        end
+                    end)
+
                     row.btn.label:SetText("Remove")
                     row.btn.hoverColor = DANGER
                     SetButtonEnabled(row.btn, true)
                     row.btn:SetScript("OnClick", function()
-                        local removed = table.remove(db.spells, idx)
+                        local removed = table.remove(charDB.spells, idx)
                         if removed then
-                            cdState[removed.name] = nil
-                            db.knownDurations[removed.name] = nil
+                            local key = EntryKey(removed)
+                            cdState[key] = nil
+                            charDB.knownDurations[key] = nil
                         end
-                        RebuildBars()
-                        RefreshList()
+                        ListChanged()
                     end)
                 end
                 row:Show()
@@ -1234,15 +1693,15 @@ local function CreateOptionsPanel()
         if #entries == 0 then
             local msg
             if not searchMode then
-                msg = "No cooldowns tracked yet.\nClick + Add to choose spells."
+                msg = "Nothing tracked yet.\nClick + Add to choose spells or items."
             elseif searchFailed then
-                msg = "Spell search isn't available right now.\nTry again out of combat."
+                msg = "Search isn't available right now.\nTry again out of combat."
             elseif not indexDone and string.len(searchBox:GetText()) >= 2 then
                 msg = "Loading the full spell list...\nResults will appear in a few seconds."
             elseif searchBox:GetText() == "" then
-                msg = "Type a spell name to search."
+                msg = "Type a spell or item name to search."
             else
-                msg = "No matching spells."
+                msg = "No matching spells or items."
             end
             emptyText:SetText(msg)
             emptyText:Show()
@@ -1265,7 +1724,7 @@ local function CreateOptionsPanel()
     end
 
     local function RunSearch()
-        local results = GetSearchableSpells(searchBox:GetText())
+        local results = GetSearchResults(searchBox:GetText())
         searchFailed = results == nil
         entries = results or {}
         offset = 0
@@ -1287,17 +1746,16 @@ local function CreateOptionsPanel()
             searchBox:Show()
             searchBox:SetText("")
             searchBox:SetFocus()
-            list:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -332)
+            list:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -378)
             RunSearch()
-            return
         else
             addBtn.label:SetText("+ Add")
             searchBox:ClearFocus()
             searchBox:Hide()
-            list:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -304)
-            entries = db.spells
+            list:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -350)
+            entries = charDB.spells
+            RefreshList()
         end
-        RefreshList()
     end
 
     addBtn:SetScript("OnClick", function() SetSearchMode(not searchMode) end)
@@ -1307,7 +1765,7 @@ local function CreateOptionsPanel()
         RefreshList()
     end)
 
-    -- Searching by ID is slow, so wait for typing to pause.
+    -- Wait for typing to pause before searching.
     local searchToken = 0
     searchBox:SetScript("OnTextChanged", function(self)
         placeholder:SetShown(self:GetText() == "")
@@ -1342,6 +1800,10 @@ local function CreateOptionsPanel()
         for _, c in ipairs(controls) do c:Refresh() end
     end
 
+    function f:RefreshList()
+        if not searchMode then RefreshList() end
+    end
+
     f:SetScript("OnShow", function(self)
         self:RefreshControls()
         SetSearchMode(false)
@@ -1359,25 +1821,86 @@ ToggleOptions = function()
     optionsFrame:SetShown(not optionsFrame:IsShown())
 end
 
+local function OpenOptions()
+    if optionsFrame then optionsFrame:Show() end
+end
+
+-- A page under Esc > Options > AddOns that points to the real window.
+local function RegisterSettingsPage()
+    local panel = CreateFrame("Frame")
+    panel.name = ADDON_TITLE
+
+    local title = CreateText(panel, 16, ACCENT)
+    title:SetPoint("TOPLEFT", panel, "TOPLEFT", 16, -16)
+    title:SetText(ADDON_TITLE)
+    local desc = CreateText(panel, 12, TEXT_MAIN)
+    desc:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -10)
+    desc:SetText("All settings are in the " .. ADDON_TITLE .. " window.\nYou can also open it with /sscd or by right-clicking a bar.")
+
+    local open = CreateFlatButton(panel, "Open Options", 120, 24)
+    open:SetPoint("TOPLEFT", desc, "BOTTOMLEFT", 0, -14)
+    open:SetScript("OnClick", function()
+        if not (InCombatLockdown and InCombatLockdown()) and HideUIPanel then
+            if SettingsPanel and SettingsPanel:IsShown() then
+                pcall(HideUIPanel, SettingsPanel)
+            elseif InterfaceOptionsFrame and InterfaceOptionsFrame:IsShown() then
+                pcall(HideUIPanel, InterfaceOptionsFrame)
+            end
+        end
+        OpenOptions()
+    end)
+
+    if Settings and Settings.RegisterCanvasLayoutCategory and Settings.RegisterAddOnCategory then
+        local category = Settings.RegisterCanvasLayoutCategory(panel, ADDON_TITLE)
+        Settings.RegisterAddOnCategory(category)
+    elseif InterfaceOptions_AddCategory then
+        InterfaceOptions_AddCategory(panel)
+    end
+end
+
 local inCombat = false
 
 -- With "Hide out of combat" on, the bars show only in combat, plus while
 -- unlocked (to position them) or while the options window is open (to see
 -- changes). Cooldowns are still tracked while the bars are hidden.
 UpdateVisibility = function()
-    local db = SimpleSpellCDTrackerDB
     if not db then return end
-    local show = not db.hideOutOfCombat
-        or inCombat
-        or not db.locked
-        or (optionsFrame ~= nil and optionsFrame:IsShown())
+    local show = not db.hideOutOfCombat or inCombat or IsPreviewing()
     container:SetShown(show and true or false)
+    if charDB then LayoutBars(true) end
 end
 
+-- Before 1.3.0 the tracked list was shared by all characters. Give it to the
+-- first character that actually has one of those spells.
+local function MigrateLegacyList()
+    local legacy = db.legacy
+    if not legacy or charDB.migrated or #charDB.spells > 0 then return false end
+    local list = SanitizeEntries(legacy.spells)
+    local belongsHere = false
+    for _, e in ipairs(list) do
+        if e.type ~= "item" and IsSpellAvailable(e, true) then
+            belongsHere = true
+            break
+        end
+    end
+    if not belongsHere then return false end
+    charDB.spells = list
+    for _, e in ipairs(list) do
+        local key = EntryKey(e)
+        local d = type(legacy.durations) == "table" and legacy.durations[key]
+        if IsNumber(d) and d > 0 then charDB.knownDurations[key] = d end
+    end
+    charDB.migrated = true
+    return true
+end
+
+-------------------------------------------------------------------------------
+-- Slash commands
+-------------------------------------------------------------------------------
 local initialized = false
 
 local function SetLocked(locked)
-    SimpleSpellCDTrackerDB.locked = locked
+    db.locked = locked
     UpdateLockState()
     if optionsFrame and optionsFrame:IsShown() then optionsFrame:RefreshControls() end
 end
@@ -1399,7 +1922,7 @@ SlashCmdList.SIMPLESPELLCD = function(msg)
         SetLocked(false)
         Print("bars unlocked. Drag them to move, then type /sscd lock.")
     elseif cmd == "reset" then
-        SimpleSpellCDTrackerDB.position = nil
+        db.position = nil
         ApplyPosition()
         Print("bar position reset.")
     else
@@ -1413,21 +1936,36 @@ end
 -------------------------------------------------------------------------------
 -- Events
 -------------------------------------------------------------------------------
+local function SafeRegisterEvent(frame, event)
+    pcall(frame.RegisterEvent, frame, event)
+end
+
 local function Initialize(eventFrame)
     SimpleSpellCDTrackerDB = CopyDefaults(DEFAULTS, SimpleSpellCDTrackerDB)
-    SanitizeDB(SimpleSpellCDTrackerDB)
-    RepairSpellIDs(SimpleSpellCDTrackerDB.spells)
+    db = SimpleSpellCDTrackerDB
+    SanitizeDB(db)
+    SimpleSpellCDTrackerCharDB = CopyDefaults(CHAR_DEFAULTS, SimpleSpellCDTrackerCharDB)
+    charDB = SimpleSpellCDTrackerCharDB
+    SanitizeCharDB(charDB)
+    MigrateLegacyList()
+    RepairSpellIDs(charDB.spells)
+
     ApplyPosition()
     inCombat = (UnitAffectingCombat and UnitAffectingCombat("player")) and true or false
     optionsFrame = CreateOptionsPanel()
-    RebuildBars()
+    pcall(RegisterSettingsPage)
+    ConfigureBars()
+
     eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
-    eventFrame:RegisterEvent("SPELLS_CHANGED")
-    eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
-    eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+    SafeRegisterEvent(eventFrame, "SPELLS_CHANGED")
+    SafeRegisterEvent(eventFrame, "BAG_UPDATE_DELAYED")
+    SafeRegisterEvent(eventFrame, "PLAYER_EQUIPMENT_CHANGED")
+    SafeRegisterEvent(eventFrame, "PLAYER_REGEN_DISABLED")
+    SafeRegisterEvent(eventFrame, "PLAYER_REGEN_ENABLED")
     initialized = true
-    if #SimpleSpellCDTrackerDB.spells == 0 then
-        Print("no spells tracked yet. Type /sscd to add some.")
+
+    if #charDB.spells == 0 then
+        Print("nothing tracked on this character yet. Type /sscd to add spells or items.")
     end
 end
 
@@ -1445,7 +1983,14 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         local _, _, spellID = ...
         pcall(OnPlayerSpellCast, spellID)
     elseif event == "SPELLS_CHANGED" then
-        pcall(RefreshSpellInfo)
+        local ok, migrated = pcall(MigrateLegacyList)
+        if ok and migrated then
+            ConfigureBars()
+            if optionsFrame:IsShown() then optionsFrame:RefreshList() end
+        end
+        pcall(RefreshEntryInfo)
+    elseif event == "BAG_UPDATE_DELAYED" or event == "PLAYER_EQUIPMENT_CHANGED" then
+        pcall(RefreshEntryInfo)
     elseif event == "PLAYER_REGEN_DISABLED" then
         inCombat = true
         UpdateVisibility()
