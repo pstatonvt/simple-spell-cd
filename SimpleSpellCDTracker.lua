@@ -1943,6 +1943,8 @@ local function CreateMinimapButton()
     icon:SetTexCoord(0.06, 0.94, 0.06, 0.94)
     icon:SetSize(18, 18)
     icon:SetPoint("TOPLEFT", b, "TOPLEFT", 7, -6)
+    -- Button collectors (Keyring, MBB...) look for .icon, as LibDBIcon has it.
+    b.icon = icon
     local border = b:CreateTexture(nil, "OVERLAY")
     border:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
     border:SetSize(53, 53)
