@@ -1,0 +1,5 @@
+package-as: SimpleSpellCDTracker
+
+ignore:
+  - assets
+  - README.md
