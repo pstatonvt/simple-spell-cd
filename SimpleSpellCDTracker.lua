@@ -34,6 +34,7 @@ local DEFAULTS = {
     spacing = 3,
     showIcons = true,
     locked = true,
+    hideOutOfCombat = false,
     colors = {
         ready = { 0.15, 0.85, 0.20 },
         cooldown = { 0.90, 0.15, 0.15 },
@@ -114,7 +115,7 @@ local function SanitizeDB(db)
     for key, range in pairs(LIMITS) do
         db[key] = IsNumber(db[key]) and Clamp(db[key], range[1], range[2]) or DEFAULTS[key]
     end
-    for _, key in ipairs({ "showIcons", "locked" }) do
+    for _, key in ipairs({ "showIcons", "locked", "hideOutOfCombat" }) do
         if type(db[key]) ~= "boolean" then db[key] = DEFAULTS[key] end
     end
     for key, default in pairs(DEFAULTS.colors) do
@@ -294,6 +295,7 @@ end
 -- Cooldown bars
 -------------------------------------------------------------------------------
 local ToggleOptions -- defined after the options panel
+local UpdateVisibility -- defined after the options panel
 
 local container = CreateFrame("Frame", "SimpleSpellCDTrackerContainer", UIParent)
 container:SetSize(200, 22)
@@ -367,6 +369,7 @@ local function UpdateLockState()
     moverOutline:SetShown(unlocked)
     moverFill:SetShown(unlocked)
     moverLabel:SetShown(unlocked)
+    if UpdateVisibility then UpdateVisibility() end
 end
 
 local function ShowBarTooltip(owner, item)
@@ -964,7 +967,7 @@ local function CreateOptionsPanel()
     local controls = {}
 
     local f = CreateFrame("Frame", "SimpleSpellCDTrackerOptions", UIParent)
-    f:SetSize(360, 540)
+    f:SetSize(360, 562)
     ApplyFramePosition(f, "optionsPosition", "CENTER", 0, 40)
     f:SetFrameStrata("DIALOG")
     f:SetClampedToScreen(true)
@@ -1028,6 +1031,17 @@ local function CreateOptionsPanel()
     iconCheck:SetPoint("TOPLEFT", f, "TOPLEFT", 112, -66)
     table.insert(controls, iconCheck)
 
+    local combatCheck = CreateCheckbox(f, "Hide out of combat", function() return db.hideOutOfCombat end, function(v)
+        db.hideOutOfCombat = v
+        UpdateVisibility()
+    end)
+    combatCheck:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -88)
+    table.insert(controls, combatCheck)
+
+    local combatHint = CreateText(f, 10, TEXT_DIM)
+    combatHint:SetPoint("LEFT", combatCheck, "RIGHT", 8, 0)
+    combatHint:SetText("(always shown while unlocked)")
+
     local resetBtn = CreateFlatButton(f, "Reset Position", 100, 20)
     resetBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -16, -65)
     resetBtn:SetScript("OnClick", function()
@@ -1036,34 +1050,34 @@ local function CreateOptionsPanel()
     end)
 
     -- Appearance
-    CreateSectionHeader(f, "Appearance", -100)
+    CreateSectionHeader(f, "Appearance", -122)
 
     local widthSlider = CreateSlider(f, "Bar Width", 120, 320, 5, FormatPixels,
         function() return db.barWidth end,
         function(v) db.barWidth = v; RebuildBars() end)
-    widthSlider:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -118)
+    widthSlider:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -140)
     table.insert(controls, widthSlider)
 
     local heightSlider = CreateSlider(f, "Bar Height", 14, 40, 1, FormatPixels,
         function() return db.barHeight end,
         function(v) db.barHeight = v; RebuildBars() end)
-    heightSlider:SetPoint("TOPLEFT", f, "TOPLEFT", 188, -118)
+    heightSlider:SetPoint("TOPLEFT", f, "TOPLEFT", 188, -140)
     table.insert(controls, heightSlider)
 
     local barAlphaSlider = CreateSlider(f, "Bar Opacity", 0.05, 1.0, 0.05, FormatPercent,
         function() return db.barAlpha end,
         function(v) db.barAlpha = v; RebuildBars() end)
-    barAlphaSlider:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -160)
+    barAlphaSlider:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -182)
     table.insert(controls, barAlphaSlider)
 
     local bgAlphaSlider = CreateSlider(f, "Background Opacity", 0, 1.0, 0.05, FormatPercent,
         function() return db.bgAlpha end,
         function(v) db.bgAlpha = v; RebuildBars() end)
-    bgAlphaSlider:SetPoint("TOPLEFT", f, "TOPLEFT", 188, -160)
+    bgAlphaSlider:SetPoint("TOPLEFT", f, "TOPLEFT", 188, -182)
     table.insert(controls, bgAlphaSlider)
 
     -- Colors
-    CreateSectionHeader(f, "Colors", -208)
+    CreateSectionHeader(f, "Colors", -230)
     local swatches = {
         { "Ready", "ready", 16 },
         { "Cooldown", "cooldown", 128 },
@@ -1071,19 +1085,19 @@ local function CreateOptionsPanel()
     }
     for _, s in ipairs(swatches) do
         local sw = CreateColorSwatch(f, s[1], s[2])
-        sw:SetPoint("TOPLEFT", f, "TOPLEFT", s[3], -226)
+        sw:SetPoint("TOPLEFT", f, "TOPLEFT", s[3], -248)
         table.insert(controls, sw)
     end
 
     -- Tracked cooldowns
-    CreateSectionHeader(f, "Tracked Cooldowns", -262, 16 + 64 + 8)
+    CreateSectionHeader(f, "Tracked Cooldowns", -284, 16 + 64 + 8)
 
     local addBtn = CreateFlatButton(f, "+ Add", 64, 20)
-    addBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -16, -256)
+    addBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -16, -278)
 
     local searchBox = CreateFrame("EditBox", nil, f)
     searchBox:SetSize(328, 22)
-    searchBox:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -282)
+    searchBox:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -304)
     searchBox:SetAutoFocus(false)
     searchBox:SetFont(FONT, 12, "")
     searchBox:SetTextColor(TEXT_MAIN[1], TEXT_MAIN[2], TEXT_MAIN[3])
@@ -1273,14 +1287,14 @@ local function CreateOptionsPanel()
             searchBox:Show()
             searchBox:SetText("")
             searchBox:SetFocus()
-            list:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -310)
+            list:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -332)
             RunSearch()
             return
         else
             addBtn.label:SetText("+ Add")
             searchBox:ClearFocus()
             searchBox:Hide()
-            list:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -282)
+            list:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -304)
             entries = db.spells
         end
         RefreshList()
@@ -1331,6 +1345,10 @@ local function CreateOptionsPanel()
     f:SetScript("OnShow", function(self)
         self:RefreshControls()
         SetSearchMode(false)
+        UpdateVisibility() -- preview the bars while configuring
+    end)
+    f:SetScript("OnHide", function()
+        UpdateVisibility()
     end)
 
     return f
@@ -1339,6 +1357,21 @@ end
 ToggleOptions = function()
     if not optionsFrame then return end
     optionsFrame:SetShown(not optionsFrame:IsShown())
+end
+
+local inCombat = false
+
+-- With "Hide out of combat" on, the bars show only in combat, plus while
+-- unlocked (to position them) or while the options window is open (to see
+-- changes). Cooldowns are still tracked while the bars are hidden.
+UpdateVisibility = function()
+    local db = SimpleSpellCDTrackerDB
+    if not db then return end
+    local show = not db.hideOutOfCombat
+        or inCombat
+        or not db.locked
+        or (optionsFrame ~= nil and optionsFrame:IsShown())
+    container:SetShown(show and true or false)
 end
 
 local initialized = false
@@ -1385,10 +1418,13 @@ local function Initialize(eventFrame)
     SanitizeDB(SimpleSpellCDTrackerDB)
     RepairSpellIDs(SimpleSpellCDTrackerDB.spells)
     ApplyPosition()
+    inCombat = (UnitAffectingCombat and UnitAffectingCombat("player")) and true or false
     optionsFrame = CreateOptionsPanel()
     RebuildBars()
     eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
     eventFrame:RegisterEvent("SPELLS_CHANGED")
+    eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
+    eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
     initialized = true
     if #SimpleSpellCDTrackerDB.spells == 0 then
         Print("no spells tracked yet. Type /sscd to add some.")
@@ -1410,14 +1446,21 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         pcall(OnPlayerSpellCast, spellID)
     elseif event == "SPELLS_CHANGED" then
         pcall(RefreshSpellInfo)
+    elseif event == "PLAYER_REGEN_DISABLED" then
+        inCombat = true
+        UpdateVisibility()
+    elseif event == "PLAYER_REGEN_ENABLED" then
+        inCombat = false
+        UpdateVisibility()
     end
 end)
 
--- Update loop (works in and out of combat). Errors are caught and reported
--- once in chat instead of firing 20 times a second.
+-- Update loop (works in and out of combat). It runs on the event frame rather
+-- than the bars so cooldowns keep being tracked while the bars are hidden.
+-- Errors are caught and reported once in chat instead of 20 times a second.
 local elapsedSinceUpdate = 0
 local errorReported = false
-container:SetScript("OnUpdate", function(_, elapsed)
+eventFrame:SetScript("OnUpdate", function(_, elapsed)
     if not initialized then return end
     elapsedSinceUpdate = elapsedSinceUpdate + elapsed
     if elapsedSinceUpdate < 0.05 then return end

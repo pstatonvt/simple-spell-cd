@@ -1,7 +1,7 @@
 ## Interface: 16001
 ## Title: |cffff7d0aSimple Spell CD Tracker|r
 ## Notes: Clean, configurable cooldown bars for any spell. Right-click a bar or type /sscd for options.
-## Version: 1.1.0
+## Version: 1.2.0
 ## IconTexture: Interface\AddOns\SimpleSpellCDTracker\media\icon
 ## SavedVariables: SimpleSpellCDTrackerDB
 
